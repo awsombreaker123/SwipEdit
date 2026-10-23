@@ -1280,8 +1280,11 @@
         ✨ Демо
       </button>
       <button type="button" class="btn" id="btn-undo" title="Отменить (Ctrl+Z)">↶ Отмена</button>
-        <span>Параметры карты и ресурсы</span>
       <button type="button" class="btn" id="btn-redo" title="Повторить (Ctrl+Y)">↷ Повтор</button>
+            <div class="lang-switch-group" id="lang-switch-group" title="Язык интерфейса / Interface Language" style="display:inline-flex;align-items:center;background:var(--bg-0);border:1px solid var(--border-hi);border-radius:var(--radius-sm);padding:2px;gap:2px;">
+        <button type="button" class="btn btn-sm lang-btn active" data-lang="ru" style="padding:4px 8px;font-size:11px;border:none;background:var(--accent);color:#fff;font-weight:800;">RU</button>
+        <button type="button" class="btn btn-sm lang-btn" data-lang="en" style="padding:4px 8px;font-size:11px;border:none;background:transparent;color:var(--text-secondary);font-weight:800;">EN</button>
+      </div>
       <button type="button" class="btn" id="btn-export-json" title="Скачать отдельно chart.json и meta.json">
         📄 JSON
       </button>
@@ -1313,7 +1316,7 @@
     <!-- левая колонка -->
     <section class="panel panel-meta">
       <div class="panel-header">
-        <span>1. Параметры карты и ресурсы</span>
+        <span>Параметры карты и ресурсы</span>
       </div>
       <div class="panel-body">
 
@@ -1549,7 +1552,6 @@
               <option value="4" selected>1/4 доли</option>
               <option value="8">1/8 доли</option>
               <option value="16">1/16 доли</option>
-        <span>Ноты, скорость, эффекты и надписи</span>
               <option value="-1">⚡ Пик волны (Onset)</option>
               <option value="-2">🧲 Сетка + Пик</option>
               <option value="0">Свободно</option>
@@ -1590,7 +1592,7 @@
     <!-- ПРАВАЯ КОЛОНКА: НОТЫ, ЭФФЕКТЫ, СКОРОСТЬ СКРОЛЛА И НАДПИСИ ВМЕСТО КОМБО -->
     <section class="panel panel-fx">
       <div class="panel-header">
-        <span>3. Ноты, скорость, эффекты и надписи</span>
+        <span>Ноты, скорость, эффекты и надписи</span>
       </div>
       <div class="panel-body">
 
@@ -1804,7 +1806,7 @@
     <!-- ПАНЕЛЬ АНАЛИТИКИ ПЛОТНОСТИ ЧАРТА (NPS) И БЕЗЛИМИТНОЙ СЛОЖНОСТИ В БАЛЛАХ -->
     <section class="panel panel-stats">
       <div class="panel-header">
-        <span>4. Плотность чарта (NPS) и объективная сложность в баллах (без лимита)</span>
+        <span>Плотность чарта (NPS) и объективная сложность в баллах (без лимита)</span>
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
           <button type="button" class="btn btn-sm" id="btn-open-sdp-modal" title="Открыть подробный разбор математической формулы SDP и расчёт по текущей карте">
             ❓ Как считается SDP (Формула)
@@ -1852,15 +1854,6 @@
           <div class="section-title">
             <span>📈 График плотности нот по секундам (клик по пику — переход к дропу)</span>
             <span id="nps-chart-hint" style="font-size:11px;color:var(--text-secondary);">1 столбик = 1 секунда</span>
-    <!-- sdp это что? (what?) -->
-          </div>
-          <div class="nps-chart-wrap">
-            <canvas id="nps-chart-canvas" width="920" height="110"></canvas>
-          </div>
-        📐 Формула объективной сложности SDP (SwipEdit's Difficulty Points)
-        </div>
-      </div>
-        В отличие от ручного поля <code>difficulty</code> в <code>meta.json</code> (которое в игре ограничено <code>10.0★</code> и выставляется автором вручную), оценка <strong>SDP</strong> вычисляется напрямую из геометрии и таймингов чарта и <strong>не имеет верхнего потолка</strong> — это позволяет объективнее оценивать сложность у множества карт.
     </section>
   </main>
 
@@ -1919,15 +1912,15 @@
   </footer>
 
 
-    <!-- Попап с объяснением формулы SDP для демон-листа / невозможных уровней -->
+    <!-- sdp это что? (what?)-->
   <div class="cubeface-modal-backdrop" id="sdp-formula-modal" hidden>
     <div class="sdp-modal-card" role="dialog" aria-modal="true" aria-labelledby="sdp-modal-title">
       <button type="button" class="cubeface-modal-close" id="btn-close-sdp-modal" title="Закрыть">✕</button>
       <div style="font-size:15px;font-weight:800;color:var(--accent-2);" id="sdp-modal-title">
-        📐 Формула объективной сложности SDP (SwipEdit Difficulty Points)
+        📐 Формула объективной сложности SDP (SwipEdit's Difficulty Points)
       </div>
       <div style="color:var(--text-secondary);font-size:12px;">
-        В отличие от ручного поля <code>difficulty</code> в <code>meta.json</code> (которое в игре ограничено <code>10.0★</code> и выставляется автором вручную), рейтинг <strong>SDP</strong> вычисляется напрямую из геометрии и таймингов чарта и <strong>не имеет верхнего потолка</strong> — специально для ранжирования челленджей и листа невозможных уровней.
+        В отличие от ручного поля <code>difficulty</code> в <code>meta.json</code> (которое в игре ограничено <code>10.0★</code> и выставляется автором вручную), оценка <strong>SDP</strong> вычисляется напрямую из геометрии и таймингов чарта и <strong>не имеет верхнего потолка</strong> — это позволяет объективнее оценивать сложность у множества карт.
       </div>
 
       <div>
@@ -1950,7 +1943,6 @@
         </div>
       </div>
 
-          HTML5 Canvas 2D, Web Audio API, встроенный упаковщик ZIP/Deflate (<code>.swmap</code>), все 24 карты и треки из 3 официальных плейлистов (<em>Swipetava OST</em>, <em>RCGD VERSE OST Vol. 1 &amp; Vol. 2</em>).
       <div>
         <strong>3. Скорость чтения (M_speed) и мгновенный стрейн (strain_i):</strong>
         <div class="sdp-formula-box">
@@ -1977,7 +1969,7 @@
         <strong>5. Итоговый балл SDP и перевод в честные звёзды (Auto ★):</strong>
         <div class="sdp-formula-box">
           SDP = (33.5·NPS_avg + 10.8·NPS_peak3s + 6.0·mean(strain) + 3.7·P90(strain)) · L_mod + E_pts<br/>
-          Auto ★ = round_0.5(SDP / 65) &nbsp;&nbsp;(1★ ≈ 65 SDP; 1–5★ белые, 5.5–10★ красные поверх, &gt;10★ Impossible List)
+          Auto ★ = round_0.5(SDP / 65) &nbsp;&nbsp;(1★ ≈ 65 SDP; 1–5★ белые, 5.5–10★ красные поверх, &gt;10★ невозможная карта)
         </div>
       </div>
 
@@ -2018,7 +2010,7 @@
       <div class="credits-card">
         <div class="credits-card-title">Что было использовано</div>
         <div class="credits-card-body">
-          HTML5 Canvas 2D, Web Audio API, встроенный упаковщик ZIP/Deflate (<code>.swmap</code>), все 24 карты и треки из 3 официальных плейлистов (<em>Swipetava OST</em>, <em>RCGD VERS OST Vol. 1 &amp; Vol. 2</em>).
+          HTML5 Canvas 2D, Web Audio API, встроенный упаковщик ZIP/Deflate (<code>.swmap</code>), все 24 карты и треки из 3 официальных плейлистов (<em>Swipetava OST</em>, <em>RCGD VERSE OST Vol. 1 &amp; Vol. 2</em>).
         </div>
       </div>
     </div>
