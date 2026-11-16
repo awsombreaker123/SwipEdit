@@ -723,15 +723,16 @@
     }
   }
 
-  function _playOsuHitBuffer(ctx, buf, volMult, gainVal) {
+  function _playOsuHitBuffer(ctx, buf, volMult, gainVal, whenCtx = 0) {
     if (!ctx || !buf) return;
+    const tStart = (whenCtx && whenCtx > ctx.currentTime) ? whenCtx : ctx.currentTime;
     const src = ctx.createBufferSource();
     src.buffer = buf;
     const gain = ctx.createGain();
-    gain.gain.setValueAtTime(Math.min(2.2, Math.max(0.005, volMult * (gainVal / 0.18))), ctx.currentTime);
+    gain.gain.setValueAtTime(Math.min(2.2, Math.max(0.005, volMult * (gainVal / 0.18))), tStart);
     src.connect(gain);
     gain.connect(ctx.destination);
-    src.start(0);
+    src.start(tStart);
   }
 
   // Предварительно декодируем хитсаунд при первом же клике/тапе/клавише на странице
@@ -744,10 +745,11 @@
     }, { once: true, passive: true });
   });
 
-  function playTick(freq = 1100, gainVal = 0.16, duration = 0.035, type = 'triangle', channel = 'hit') {
+  function playTick(freq = 1100, gainVal = 0.16, duration = 0.035, type = 'triangle', channel = 'hit', whenCtx = 0) {
     try {
       const ctx = ensureAudioCtx();
       if (!ctx) return;
+      const tStart = (whenCtx && whenCtx > ctx.currentTime) ? whenCtx : ctx.currentTime;
       const volMult = channel === 'metro'
         ? (state.metronomeVolume !== undefined ? state.metronomeVolume : 1.1)
         : (state.hitsoundVolume !== undefined ? state.hitsoundVolume : 1.1);
@@ -756,11 +758,11 @@
       // Для хитсаунда нот всегда используем сэмпл osu! (включая самую первую ноту)
       if (channel === 'hit') {
         if (_osuHitBuffer) {
-          _playOsuHitBuffer(ctx, _osuHitBuffer, volMult, gainVal);
+          _playOsuHitBuffer(ctx, _osuHitBuffer, volMult, gainVal, tStart);
           return;
         }
         ensureOsuHitsoundBuffer(ctx).then((buf) => {
-          if (buf) _playOsuHitBuffer(ctx, buf, volMult, gainVal);
+          if (buf) _playOsuHitBuffer(ctx, buf, volMult, gainVal, 0);
         });
         return;
       }
@@ -769,15 +771,113 @@
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = type;
-      osc.frequency.setValueAtTime(freq, ctx.currentTime);
-      osc.frequency.exponentialRampToValueAtTime(freq * 0.45, ctx.currentTime + duration);
-      gain.gain.setValueAtTime(effectiveGain, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+      osc.frequency.setValueAtTime(freq, tStart);
+      osc.frequency.exponentialRampToValueAtTime(freq * 0.45, tStart + duration);
+      gain.gain.setValueAtTime(effectiveGain, tStart);
+      gain.gain.exponentialRampToValueAtTime(0.001, tStart + duration);
       osc.connect(gain);
       gain.connect(ctx.destination);
-      osc.start();
-      osc.stop(ctx.currentTime + duration);
+      osc.start(tStart);
+      osc.stop(tStart + duration);
     } catch (_) {}
+  }
+
+  // --- Единый сэмпл-точный аудиодвижок BGM на Web Audio API (без рассинхрона MP3-перемотки) ---
+  let _bgmSourceNode = null;
+  let _bgmGainNode = null;
+  let _bgmPlaying = false;
+  let _bgmStartCtxTime = 0;
+  let _bgmStartTrackTime = 0;
+  let _bgmRate = 1.0;
+  let _schedNextNoteIdx = 0;
+  let _schedUpToTrackTime = 0;
+
+  function resetTickScheduler(fromTrackTime) {
+    const notes = state.chart.notes || [];
+    let lo = 0, hi = notes.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (notes[mid].time < fromTrackTime - 0.0005) lo = mid + 1;
+      else hi = mid;
+    }
+    _schedNextNoteIdx = lo;
+    _schedUpToTrackTime = fromTrackTime;
+  }
+
+  function stopBgmWebAudio() {
+    _bgmPlaying = false;
+    if (_bgmSourceNode) {
+      try { _bgmSourceNode.onended = null; _bgmSourceNode.stop(); } catch (_) {}
+      try { _bgmSourceNode.disconnect(); } catch (_) {}
+      _bgmSourceNode = null;
+    }
+  }
+
+  function getExactBgmTime() {
+    if (_bgmPlaying && state.audioCtx && state.audioBuffer) {
+      return _bgmStartTrackTime + Math.max(0, state.audioCtx.currentTime - _bgmStartCtxTime) * _bgmRate;
+    }
+    if (state.audioEl && state.audioEl.src && !state.audioEl.paused) {
+      return state.audioEl.currentTime;
+    }
+    return state.currentTime;
+  }
+
+  function updateBgmGainAndRate() {
+    const vol = Math.max(0, Math.min(1, state.bgmVolume !== undefined ? state.bgmVolume : 0.70));
+    const rate = Math.max(0.1, Math.min(4.0, Number(state.playbackRate) || 1.0));
+    if (state.audioEl) {
+      state.audioEl.volume = vol;
+      state.audioEl.playbackRate = rate;
+    }
+    if (state.audioCtx && _bgmGainNode) {
+      _bgmGainNode.gain.setValueAtTime(vol, state.audioCtx.currentTime);
+    }
+    if (_bgmPlaying && state.audioCtx && _bgmSourceNode && Math.abs(rate - _bgmRate) > 1e-4) {
+      const nowTrack = getExactBgmTime();
+      _bgmStartTrackTime = nowTrack;
+      _bgmStartCtxTime = state.audioCtx.currentTime;
+      _bgmRate = rate;
+      _bgmSourceNode.playbackRate.setValueAtTime(rate, state.audioCtx.currentTime);
+      resetTickScheduler(nowTrack);
+    }
+  }
+
+  function startBgmWebAudio(offsetSec) {
+    stopBgmWebAudio();
+    const ctx = ensureAudioCtx();
+    if (!ctx || !state.audioBuffer) return false;
+    if (ctx.state === 'suspended') {
+      try { ctx.resume(); } catch (_) {}
+    }
+    if (!_bgmGainNode) {
+      _bgmGainNode = ctx.createGain();
+      _bgmGainNode.connect(ctx.destination);
+    }
+    const vol = Math.max(0, Math.min(1, state.bgmVolume !== undefined ? state.bgmVolume : 0.70));
+    _bgmGainNode.gain.setValueAtTime(vol, ctx.currentTime);
+
+    const dur = state.audioBuffer.duration;
+    const clampedOffset = Math.max(0, Math.min(Math.max(0, dur - 0.005), offsetSec));
+    const rate = Math.max(0.1, Math.min(4.0, Number(state.playbackRate) || 1.0));
+
+    const src = ctx.createBufferSource();
+    src.buffer = state.audioBuffer;
+    src.playbackRate.setValueAtTime(rate, ctx.currentTime);
+    src.connect(_bgmGainNode);
+
+    const startWhen = ctx.currentTime + 0.004;
+    src.start(startWhen, clampedOffset);
+    _bgmSourceNode = src;
+    _bgmStartCtxTime = startWhen;
+    _bgmStartTrackTime = clampedOffset;
+    _bgmRate = rate;
+    _bgmPlaying = true;
+    if (state.audioEl && !state.audioEl.paused) {
+      try { state.audioEl.pause(); } catch (_) {}
+    }
+    resetTickScheduler(clampedOffset);
+    return true;
   }
 
   function parseHexRgb(hex) {
@@ -1610,7 +1710,7 @@
   }
 
   function getTimelineTrackLayout(H) {
-    const isPiano = state.timelineViewMode === 'pianoroll';
+    const isPiano = true;
     if (isPiano) {
       const rulerBottom = 24;
       const waveTop = 24;
@@ -1727,7 +1827,7 @@
       _cachedTlWrapW = Math.round(wrap.clientWidth || canvas.clientWidth || 360);
     }
     const cssW = Math.max(320, _cachedTlWrapW || 360);
-    const desiredH = state.timelineViewMode === 'pianoroll' ? 356 : 236;
+    const desiredH = 356;
     const dpr = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
     const physW = Math.round(cssW * dpr);
     const physH = Math.round(desiredH * dpr);
@@ -1800,7 +1900,8 @@
     const tsNum = Math.max(1, Number(state.timeSigNum) || 4);
     const tsDen = Math.max(1, Number(state.timeSigDen) || 4);
     const sigBeatSec = quarterSec * (4 / tsDen);
-    const subDiv = (state.snapDivisor && state.snapDivisor > 0) ? Math.max(1, state.snapDivisor / 4) : 1;
+    const rawDiv = (state.snapDivisor && state.snapDivisor > 0) ? state.snapDivisor : 4;
+    const subDiv = (sigBeatSec / rawDiv) * state.zoomPxPerSec >= 7 ? rawDiv : ((sigBeatSec / 2) * state.zoomPxPerSec >= 7 ? 2 : 1);
     const stepSec = sigBeatSec / subDiv;
 
     const firstStepIdx = Math.floor((startSec - tp.time) / stepSec);
@@ -1868,10 +1969,15 @@
       const barW = dpr >= 2 ? 0.85 : 1.5;
       ctx.fillStyle = isLight ? 'rgba(21, 101, 148, 0.62)' : 'rgba(56, 189, 248, 0.55)';
       for (let px = labelW; px < W; px += stepPx) {
-        const t = xToTime(px, labelW);
-        if (t < 0 || t > state.duration) continue;
-        const pIdx = Math.floor((t / state.duration) * peaks.length);
-        const amp = peaks[Math.min(peaks.length - 1, Math.max(0, pIdx))] || 0;
+        const t0 = xToTime(px, labelW);
+        const t1 = xToTime(px + stepPx, labelW);
+        if (t1 < 0 || t0 > state.duration) continue;
+        const i0 = Math.max(0, Math.floor((Math.max(0, t0) / state.duration) * peaks.length));
+        const i1 = Math.min(peaks.length - 1, Math.max(i0, Math.ceil((Math.min(state.duration, t1) / state.duration) * peaks.length)));
+        let amp = 0;
+        for (let k = i0; k <= i1; k++) {
+          if (peaks[k] > amp) amp = peaks[k];
+        }
         const h = Math.max(1, amp * waveHalfH * 2);
         ctx.fillRect(px, waveMidY - h / 2, barW, h);
       }
@@ -2749,8 +2855,11 @@
         const i = Number(inp.getAttribute('data-tp-time'));
         pushUndo();
         state.chart.timing[i].time = roundTime(Number(e.target.value) || 0);
-        if (i === 0) state.chart.gridOffset = state.chart.timing[0].time;
         sortChart();
+        if (state.chart.timing.length > 0) {
+          state.chart.gridOffset = roundTime(state.chart.timing[0].time);
+          state.chart.bpm = state.chart.timing[0].bpm;
+        }
         syncMetaAndChartInputs();
         refreshAllViews();
       });
@@ -2771,6 +2880,12 @@
         if (state.chart.timing.length <= 1) return;
         pushUndo();
         state.chart.timing.splice(i, 1);
+        sortChart();
+        if (state.chart.timing.length > 0) {
+          state.chart.gridOffset = roundTime(state.chart.timing[0].time);
+          state.chart.bpm = state.chart.timing[0].bpm;
+        }
+        syncMetaAndChartInputs();
         refreshAllViews();
       });
     });
@@ -3505,10 +3620,15 @@
 
   function setCurrentTime(sec, keepPlaying = false) {
     state.currentTime = Math.max(0, Math.min(state.duration || 600, sec));
-    if (state.audioEl && state.audioEl.src && !keepPlaying) {
-      try {
-        state.audioEl.currentTime = state.currentTime;
-      } catch (_) {}
+    if (!keepPlaying) {
+      if (state.isPlaying && state.audioBuffer) {
+        startBgmWebAudio(state.currentTime);
+      } else {
+        resetTickScheduler(state.currentTime);
+        if (state.audioEl && state.audioEl.src) {
+          try { state.audioEl.currentTime = state.currentTime; } catch (_) {}
+        }
+      }
     }
     const prevVis = isPreviewVisible();
     if (prevVis && state.bgVideoEl && state.bgVideoReady && state.videoBgPreviewEnabled && !keepPlaying) {
@@ -3558,9 +3678,11 @@
       if (ctx) {
         const copyBuf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
         const decoded = await ctx.decodeAudioData(copyBuf);
+        stopBgmWebAudio();
         state.audioBuffer = decoded;
         state.duration = Math.max(1, decoded.duration);
-        state.waveformPeaks = computePeaks(decoded, 3000);
+        const dynamicBins = Math.min(240000, Math.max(4000, Math.ceil(decoded.duration * 200)));
+        state.waveformPeaks = computePeaks(decoded, dynamicBins);
         computeOnsetEnvelope(decoded);
       }
     } catch (err) {
@@ -3591,7 +3713,8 @@
       const start = i * step;
       const end = Math.min(total, start + step);
       let max = 0;
-      for (let j = start; j < end; j += 4) {
+      const subStep = (end - start) > 512 ? 2 : 1;
+      for (let j = start; j < end; j += subStep) {
         const v = ch1 ? (Math.abs(ch0[j]) + Math.abs(ch1[j])) * 0.5 : Math.abs(ch0[j]);
         if (v > max) max = v;
       }
@@ -3639,34 +3762,106 @@
     for (let i = 1; i < env.length; i++) {
       flux[i] = Math.max(0, env[i] - env[i - 1]);
     }
-    let bestBpm = 120;
-    let bestScore = -1;
-    for (let bpm = 75; bpm <= 195; bpm++) {
-      const lag = Math.round((60 / bpm) * sr);
-      if (lag <= 2 || lag >= flux.length / 2) continue;
+
+    // Находим первое вступление звука и анализируем 60-секундное окно от начала вступления (или вокруг курсора, если он дальше по треку)
+    const sflux = new Float32Array(flux.length);
+    for (let i = 1; i + 1 < flux.length; i++) {
+      sflux[i] = 0.25 * flux[i - 1] + 0.5 * flux[i] + 0.25 * flux[i + 1];
+    }
+    let firstSoundIdx = 0;
+    for (let i = 0; i < env.length; i++) {
+      if (env[i] > 0.08) { firstSoundIdx = i; break; }
+    }
+    const winLen = Math.min(flux.length, sr * 60);
+    let winStart = Math.max(0, Math.min(flux.length - winLen, firstSoundIdx));
+    if (flux.length > winLen && state.currentTime > 25.0) {
+      const curCenter = Math.floor(state.currentTime * sr);
+      winStart = Math.max(0, Math.min(flux.length - winLen, curCenter - Math.floor(winLen * 0.25)));
+    }
+    const winEnd = Math.min(flux.length, winStart + winLen);
+
+    const sampleFlux = (pos) => {
+      const idx = Math.floor(pos);
+      if (idx < 0 || idx + 1 >= winEnd) return 0;
+      const frac = pos - idx;
+      return sflux[idx] * (1 - frac) + sflux[idx + 1] * frac;
+    };
+
+    const scoreBpmCandidate = (bpm) => {
+      const lag = (60 / bpm) * sr;
+      if (lag <= 4 || winStart + lag * 2 >= winEnd) return -1;
       let s = 0;
-      const limit = Math.min(flux.length - lag, sr * 45);
-      for (let i = 0; i < limit; i++) {
-        s += flux[i] * flux[i + lag];
+      const limit = Math.min(winEnd - Math.ceil(lag * 2) - 1, winStart + sr * 48);
+      for (let i = winStart; i < limit; i++) {
+        const base = flux[i];
+        if (base < 1e-4) continue;
+        s += base * (sampleFlux(i + lag) + 0.5 * sampleFlux(i + lag * 2));
       }
-      if (s > bestScore) {
-        bestScore = s;
+      return s;
+    };
+
+    let coarseBpm = 120;
+    let bestScore = -1;
+    for (let bpm = 72; bpm <= 215; bpm += 0.25) {
+      const sc = scoreBpmCandidate(bpm);
+      if (sc > bestScore) {
+        bestScore = sc;
+        coarseBpm = bpm;
+      }
+    }
+
+    let bestBpm = coarseBpm;
+    for (let bpm = Math.max(60, coarseBpm - 1.5); bpm <= Math.min(240, coarseBpm + 1.5); bpm += 0.05) {
+      const sc = scoreBpmCandidate(bpm);
+      if (sc > bestScore) {
+        bestScore = sc;
         bestBpm = bpm;
       }
     }
-    // Находим лучшую фазу (gridOffset)
-    const period = Math.round((60 / bestBpm) * sr);
-    let bestPhase = 0;
-    let bestPhaseSum = -1;
-    for (let p = 0; p < period; p++) {
-      let sum = 0;
-      for (let idx = p; idx < flux.length; idx += period) sum += flux[idx];
-      if (sum > bestPhaseSum) {
-        bestPhaseSum = sum;
-        bestPhase = p;
+
+    // Если целое или полуцелое значение BPM даёт >= 98.5% пика — фиксируем ровный студийный BPM (например 130.0 вместо 129.95)
+    const roundedHalf = Math.round(bestBpm * 2) / 2;
+    const roundedInt = Math.round(bestBpm);
+    if (scoreBpmCandidate(roundedInt) >= bestScore * 0.982) {
+      bestBpm = roundedInt;
+    } else if (scoreBpmCandidate(roundedHalf) >= bestScore * 0.99) {
+      bestBpm = roundedHalf;
+    } else {
+      bestBpm = Math.round(bestBpm * 10) / 10;
+    }
+
+    // Проверка удвоенного темпа (200..320 BPM для спидкор/метал-треков вроде 260 BPM)
+    if (bestBpm >= 100 && bestBpm <= 165) {
+      const doubleBpm = bestBpm * 2;
+      const scSingle = scoreBpmCandidate(bestBpm);
+      const scDouble = scoreBpmCandidate(doubleBpm);
+      const curUserBpm = Number(state.chart.bpm) || 120;
+      if (scDouble >= scSingle * 0.92 || Math.abs(curUserBpm - doubleBpm) <= 8) {
+        bestBpm = doubleBpm;
       }
     }
-    const offsetSec = roundTime(bestPhase / sr);
+
+    // Точный поиск фазы (gridOffset) с шагом 1 мс на активном окне
+    const periodSec = 60 / bestBpm;
+    let bestOffset = 0;
+    let bestPhaseSum = -1;
+    for (let ms = 0; ms < Math.ceil(periodSec * 1000); ms++) {
+      const candSec = ms / 1000;
+      const firstBeatK = Math.ceil(((winStart / sr) - candSec) / periodSec);
+      let sum = 0;
+      for (let k = firstBeatK; ; k++) {
+        const beatT = candSec + k * periodSec;
+        const fPos = beatT * sr;
+        if (fPos >= winEnd - 2) break;
+        sum += sampleFlux(fPos);
+      }
+      if (sum > bestPhaseSum) {
+        bestPhaseSum = sum;
+        bestOffset = candSec;
+      }
+    }
+
+    const offsetSec = roundTime(bestOffset);
     pushUndo();
     state.chart.bpm = bestBpm;
     state.chart.gridOffset = offsetSec;
@@ -4240,7 +4435,7 @@
     if (tutChk) tutChk.checked = state.chart.tutorial === 'first_swipe';
   }
 
-  function readMetaAndChartInputs() {
+  function readMetaAndChartInputs(changedId = '') {
     const getVal = (id) => {
       const el = document.getElementById(id);
       return el ? el.value : '';
@@ -4254,19 +4449,32 @@
 
     state.chart.title = state.meta.title;
     state.chart.artist = state.meta.artist;
-    state.chart.bpm = Math.max(20, Number(getVal('chart-bpm')) || 120);
     state.chart.noteTravelTime = Math.max(150, Number(getVal('chart-travel-time')) || 1000);
-    state.chart.gridOffset = Number(getVal('chart-grid-offset')) || 0;
     state.chart.audioFile = getVal('chart-audio-file') || 'track.ogg';
     state.chart.audioFormat = (state.chart.audioFile.split('.').pop() || 'ogg').toLowerCase();
     state.chart.coverFile = getVal('chart-cover-file') || 'Cover.png';
     state.chart.backgroundFile = (getVal('chart-bg-file') || '').trim();
 
+    const inpBpm = Math.max(20, Number(getVal('chart-bpm')) || 120);
+    const rawOff = Number(getVal('chart-grid-offset'));
+    const inpOffset = Number.isFinite(rawOff) ? roundTime(Math.max(0, rawOff)) : 0;
+
     if (!state.chart.timing || !state.chart.timing.length) {
-      state.chart.timing = [{ time: state.chart.gridOffset, bpm: state.chart.bpm }];
+      state.chart.bpm = inpBpm;
+      state.chart.gridOffset = inpOffset;
+      state.chart.timing = [{ time: inpOffset, bpm: inpBpm }];
+    } else if (changedId === 'chart-bpm') {
+      state.chart.bpm = inpBpm;
+      state.chart.timing[0].bpm = inpBpm;
+    } else if (changedId === 'chart-grid-offset') {
+      state.chart.gridOffset = inpOffset;
+      state.chart.timing[0].time = inpOffset;
+      sortChart();
     } else {
-      state.chart.timing[0].time = state.chart.gridOffset;
-      state.chart.timing[0].bpm = state.chart.bpm;
+      // При экспорте и прочих полях никогда не затираем timing[0] старым значением инпута!
+      sortChart();
+      state.chart.gridOffset = roundTime(Number(state.chart.timing[0].time) || 0);
+      state.chart.bpm = Math.max(20, Number(state.chart.timing[0].bpm) || inpBpm);
     }
   }
 
@@ -4366,6 +4574,7 @@
     if (state.audioEl) {
       try { state.audioEl.removeAttribute('src'); state.audioEl.load(); } catch (_) {}
     }
+    stopBgmWebAudio();
     state.audioBuffer = null;
     state.waveformPeaks = null;
     state.onsetEnv = null;
@@ -4522,7 +4731,7 @@
     }
   }
 
-  // --- Главный цикл воспроизведения (requestAnimationFrame) ---
+  // --- Главный цикл воспроизведения (единые часы Web Audio API + сэмпл-точное планирование тиков) ---
   let lastFrameTs = performance.now();
   function animationLoop(nowTs) {
     const dt = Math.min(0.1, (nowTs - lastFrameTs) / 1000);
@@ -4530,7 +4739,9 @@
 
     if (state.isPlaying) {
       const prevTime = state.currentTime;
-      if (state.audioEl && state.audioEl.src && !state.audioEl.paused) {
+      if (_bgmPlaying && state.audioCtx && state.audioBuffer) {
+        state.currentTime = getExactBgmTime();
+      } else if (state.audioEl && state.audioEl.src && !state.audioEl.paused) {
         state.currentTime = state.audioEl.currentTime;
       } else {
         state.currentTime += dt * state.playbackRate;
@@ -4539,38 +4750,73 @@
       if (state.currentTime >= state.duration) {
         state.currentTime = 0;
         pausePlayback();
-      }
-
-      // Проверяем пересечение нот для хитсаунда через бинарный поиск O(log N)
-      if (state.hitsoundEnabled && state.currentTime >= prevTime) {
-        const notes = state.chart.notes;
-        let lo = 0, hi = notes.length;
-        while (lo < hi) {
-          const mid = (lo + hi) >> 1;
-          if (notes[mid].time <= prevTime) lo = mid + 1;
-          else hi = mid;
+      } else if (_bgmPlaying && state.audioCtx && state.audioBuffer) {
+        // Опережающее планирование (65 мс вперёд) на тех же аппаратных часах AudioContext, что и музыка
+        const lookaheadTrack = Math.min(state.duration, state.currentTime + 0.065 * _bgmRate);
+        const notes = state.chart.notes || [];
+        while (_schedNextNoteIdx < notes.length && notes[_schedNextNoteIdx].time <= lookaheadTrack) {
+          const nt = notes[_schedNextNoteIdx].time;
+          while (_schedNextNoteIdx + 1 < notes.length && Math.abs(notes[_schedNextNoteIdx + 1].time - nt) <= 0.003) {
+            _schedNextNoteIdx++;
+          }
+          if (state.hitsoundEnabled && nt >= _bgmStartTrackTime - 0.002) {
+            const whenCtx = Math.max(state.audioCtx.currentTime, _bgmStartCtxTime + (nt - _bgmStartTrackTime) / _bgmRate);
+            playTick(1320, 0.22, 0.036, 'triangle', 'hit', whenCtx);
+          }
+          _schedNextNoteIdx++;
         }
-        if (lo < notes.length && notes[lo].time <= state.currentTime) {
-          playTick(1320, 0.22, 0.036, 'triangle', 'hit');
-        }
-      }
 
-      // Проверяем пересечение долей для метронома (с учётом тактового размера N/M: 3/4, 4/4, 5/4, 6/8, 11/8 и т.д.)
-      if (state.metronomeEnabled) {
-        const tp = getActiveTimingAt(state.currentTime);
-        const quarterSec = 60 / (tp.bpm || 120);
-        const tsNum = Math.max(1, Number(state.timeSigNum) || 4);
-        const tsDen = Math.max(1, Number(state.timeSigDen) || 4);
-        const sigBeatSec = quarterSec * (4 / tsDen);
-        const prevBeat = Math.floor((prevTime - tp.time) / sigBeatSec);
-        const curBeat = Math.floor((state.currentTime - tp.time) / sigBeatSec);
-        if (curBeat > prevBeat && state.currentTime >= tp.time) {
-          const beatInBar = ((curBeat % tsNum) + tsNum) % tsNum;
-          const isDownbeat = beatInBar === 0;
-          const isCompoundSubAccent = !isDownbeat && tsDen === 8 && (tsNum % 3 === 0) && (beatInBar % 3 === 0);
-          const freq = isDownbeat ? 1580 : (isCompoundSubAccent ? 1140 : 880);
-          const gain = isDownbeat ? 0.24 : (isCompoundSubAccent ? 0.19 : 0.15);
-          playTick(freq, gain, 0.045, 'sine', 'metro');
+        if (state.metronomeEnabled && lookaheadTrack > _schedUpToTrackTime) {
+          const tp = getActiveTimingAt(lookaheadTrack);
+          const quarterSec = 60 / (tp.bpm || 120);
+          const tsNum = Math.max(1, Number(state.timeSigNum) || 4);
+          const tsDen = Math.max(1, Number(state.timeSigDen) || 4);
+          const sigBeatSec = quarterSec * (4 / tsDen);
+          const firstK = Math.floor((_schedUpToTrackTime - tp.time) / sigBeatSec) + 1;
+          const lastK = Math.floor((lookaheadTrack - tp.time) / sigBeatSec);
+          for (let k = firstK; k <= lastK; k++) {
+            const beatTime = tp.time + k * sigBeatSec;
+            if (beatTime < tp.time - 1e-4 || beatTime < 0) continue;
+            const beatInBar = ((k % tsNum) + tsNum) % tsNum;
+            const isDownbeat = beatInBar === 0;
+            const isCompoundSubAccent = !isDownbeat && tsDen === 8 && (tsNum % 3 === 0) && (beatInBar % 3 === 0);
+            const freq = isDownbeat ? 1580 : (isCompoundSubAccent ? 1140 : 880);
+            const gain = isDownbeat ? 0.24 : (isCompoundSubAccent ? 0.19 : 0.15);
+            const whenCtx = Math.max(state.audioCtx.currentTime, _bgmStartCtxTime + (beatTime - _bgmStartTrackTime) / _bgmRate);
+            playTick(freq, gain, 0.045, 'sine', 'metro', whenCtx);
+          }
+        }
+        _schedUpToTrackTime = Math.max(_schedUpToTrackTime, lookaheadTrack);
+      } else {
+        // Резервный режим без декодированного буфера (синтезатор без аудиофайла)
+        if (state.hitsoundEnabled && state.currentTime >= prevTime) {
+          const notes = state.chart.notes;
+          let lo = 0, hi = notes.length;
+          while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (notes[mid].time <= prevTime) lo = mid + 1;
+            else hi = mid;
+          }
+          if (lo < notes.length && notes[lo].time <= state.currentTime) {
+            playTick(1320, 0.22, 0.036, 'triangle', 'hit');
+          }
+        }
+        if (state.metronomeEnabled) {
+          const tp = getActiveTimingAt(state.currentTime);
+          const quarterSec = 60 / (tp.bpm || 120);
+          const tsNum = Math.max(1, Number(state.timeSigNum) || 4);
+          const tsDen = Math.max(1, Number(state.timeSigDen) || 4);
+          const sigBeatSec = quarterSec * (4 / tsDen);
+          const prevBeat = Math.floor((prevTime - tp.time) / sigBeatSec);
+          const curBeat = Math.floor((state.currentTime - tp.time) / sigBeatSec);
+          if (curBeat > prevBeat && state.currentTime >= tp.time) {
+            const beatInBar = ((curBeat % tsNum) + tsNum) % tsNum;
+            const isDownbeat = beatInBar === 0;
+            const isCompoundSubAccent = !isDownbeat && tsDen === 8 && (tsNum % 3 === 0) && (beatInBar % 3 === 0);
+            const freq = isDownbeat ? 1580 : (isCompoundSubAccent ? 1140 : 880);
+            const gain = isDownbeat ? 0.24 : (isCompoundSubAccent ? 0.19 : 0.15);
+            playTick(freq, gain, 0.045, 'sine', 'metro');
+          }
         }
       }
 
@@ -4604,16 +4850,22 @@
   }
 
   function startPlayback() {
-    ensureAudioCtx();
+    const ctx = ensureAudioCtx();
+    if (ctx) ensureOsuHitsoundBuffer(ctx);
     state.isPlaying = true;
     syncPlayButtonsUI();
 
-    if (state.audioEl && state.audioEl.src) {
+    if (state.audioBuffer) {
+      startBgmWebAudio(state.currentTime);
+    } else if (state.audioEl && state.audioEl.src) {
       state.audioEl.currentTime = state.currentTime;
       state.audioEl.playbackRate = state.playbackRate;
       state.audioEl.volume = Math.max(0, Math.min(1, state.bgmVolume !== undefined ? state.bgmVolume : 0.70));
       state.audioEl.play().catch(() => {});
+    } else {
+      resetTickScheduler(state.currentTime);
     }
+
     if (isPreviewVisible() && state.bgVideoEl && state.bgVideoReady && state.videoBgPreviewEnabled) {
       try {
         const vDur = state.bgVideoEl.duration;
@@ -4625,7 +4877,11 @@
   }
 
   function pausePlayback() {
+    if (_bgmPlaying) {
+      state.currentTime = getExactBgmTime();
+    }
     state.isPlaying = false;
+    stopBgmWebAudio();
     syncPlayButtonsUI();
     if (state.audioEl && !state.audioEl.paused) {
       state.audioEl.pause();
@@ -4787,7 +5043,7 @@
         if (id === 'meta-difficulty') {
           document.getElementById('meta-difficulty-num').value = el.value;
         }
-        readMetaAndChartInputs();
+        readMetaAndChartInputs(id);
         renderPreviewCanvas();
         renderTimelineCanvas();
         renderTimingTable();
@@ -4931,7 +5187,7 @@
 
     document.getElementById('playback-rate-select').addEventListener('change', (e) => {
       state.playbackRate = Number(e.target.value) || 1.0;
-      if (state.audioEl) state.audioEl.playbackRate = state.playbackRate;
+      updateBgmGainAndRate();
       state.audioEl.volume = Math.max(0, Math.min(1, state.bgmVolume !== undefined ? state.bgmVolume : 0.70));
     });
 
@@ -4959,13 +5215,39 @@
 
     document.getElementById('btn-add-timing-point').addEventListener('click', () => {
       pushUndo();
+      const activeTp = getActiveTimingAt(state.currentTime);
       state.chart.timing.push({
-        time: roundTime(snapTime(state.currentTime)),
-        bpm: state.chart.bpm || 120
+        time: roundTime(state.currentTime),
+        bpm: activeTp.bpm || state.chart.bpm || 120
       });
       sortChart();
+      if (state.chart.timing.length > 0) {
+        state.chart.gridOffset = roundTime(state.chart.timing[0].time);
+        state.chart.bpm = state.chart.timing[0].bpm;
+      }
+      syncMetaAndChartInputs();
       refreshAllViews();
     });
+
+    const btnOffsetToCursor = document.getElementById('btn-offset-to-cursor');
+    if (btnOffsetToCursor) {
+      btnOffsetToCursor.addEventListener('click', () => {
+        pushUndo();
+        const t = roundTime(state.currentTime);
+        state.chart.gridOffset = t;
+        if (!state.chart.timing || !state.chart.timing.length) {
+          state.chart.timing = [{ time: t, bpm: state.chart.bpm || 120 }];
+        } else {
+          state.chart.timing[0].time = t;
+          sortChart();
+          state.chart.gridOffset = roundTime(state.chart.timing[0].time);
+          state.chart.bpm = state.chart.timing[0].bpm;
+        }
+        syncMetaAndChartInputs();
+        refreshAllViews();
+        setStatus(`Сдвиг сетки (gridOffset) выставлен на курсор: ${t.toFixed(3)} сек`);
+      });
+    }
 
     document.getElementById('event-list-filter').addEventListener('change', renderEventsList);
 
@@ -5270,6 +5552,12 @@
       if (e.code === 'BracketRight') {
         e.preventDefault();
         stepBySnap(1);
+        return;
+      }
+
+      if (e.code === 'KeyT' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        if (!e.repeat) handleTapTempo();
         return;
       }
 
@@ -5898,7 +6186,7 @@
       if (volBgmSlider) {
         const v = Math.max(0, Math.min(100, Number(volBgmSlider.value)));
         state.bgmVolume = v / 100;
-        if (state.audioEl) state.audioEl.volume = state.bgmVolume;
+        updateBgmGainAndRate();
         if (volBgmVal) volBgmVal.textContent = `${v}%`;
         try { localStorage.setItem('swipedit_vol_bgm', String(v)); } catch (_) {}
       }
@@ -6108,7 +6396,14 @@
   window.drawArrowShape = drawArrowShape;
 
   // --- Модуль локализации интерфейса (RU / EN), комментарии в коде и пасхалка Робтопа остаются нетронутыми ---
-  const I18N_DICT_EN = {"📈 Кривая плотности чарта (клик — переход к моменту)": "📈 Chart density curve (click to jump)", "Плавная кривая NPS": "Smooth NPS curve", "Поставь ноты на карту, чтобы увидеть плавную кривую NPS": "Place notes on the chart to see the smooth NPS curve", "Перетащи окно за шапку": "Drag window by header", "(6) и": "(6) and", "(7) с чартами, обложками и автоподгрузкой песен:": "(7) with charts, covers and automatic song loading:", "(meta.json + chart.json + ассеты)": "(meta.json + chart.json + assets)", "(которое в игре ограничено": "(which is limited in the game to", "(перетащи любую выделенную ноту, чтобы сдвинуть всю группу)": "(drag any selected note to move the whole group)", "(с защитой 1-й секунды)": "(with 1st-second protection)", ") получают прогрессивный бонус выносливости.": ") earn a progressive endurance bonus.", "), все 24 карты и треки из 3 официальных плейлистов (": "), all 24 maps and tracks from the 3 official playlists (", "): тап по строке нужного направления ставит ноту, а тап по другой строке в том же столбце собирает": "): tap a lane to place a note, and tap another lane in the same column to build", "+ Точка на курсоре": "+ Point at cursor", "+10мс": "+10ms", "+10мс ⏩": "+10ms ⏩", "+1мс": "+1ms", "+1мс ▶": "+1ms ▶", ", а длинные выматывающие треки (>95 с и >240 нот, как": ", while long grueling tracks (>95 s and >240 notes, as", "-10мс": "-10ms", "-1мс": "-1ms", "00:00.000 (0.000s) | Такт 1.1": "00:00.000 (0.000s) | Bar 1.1", "1 доля (в бит)": "1 beat (on the beat)", "1 столбик = 1 секунда": "1 bar = 1 second", "1 такт (4 доли)": "1 bar (4 beats)", "Параметры карты и ресурсы": "Map parameters and assets", "1. Плотность и активный отрезок (Active Span):": "1. Density and active span (Active Span):", "1.0x (Сброс)": "1.0x (Reset)", "1/1 доли": "1/1 beats", "1/16 доли": "1/16 beat", "1/2 доли": "1/2 beats", "1/2 доли (быстро)": "1/2 beats (fast)", "1/4 доли": "1/4 beats", "1/8 доли": "1/8 beats", "10-рядном Пиано-ролле": "10-lane Piano Roll", "1000 мс": "1000 ms", "2 доли": "2 beats", "2. Вес каждого таймкода (w_i) — стаки, диагонали, углы и реверсы:": "2. Weight of each timecode (w_i) — stacks, diagonals, angles and reverses:", "3. Ноты, скорость, эффекты и надписи": "3. Notes, Speed, Effects & Texts", "3. Скорость чтения (M_speed) и мгновенный стрейн (strain_i):": "3. Reading speed (M_speed) and instant strain (strain_i):", "4. Множитель длины и выносливости марафона (L_mod и E_pts):": "4. Length and marathon endurance multiplier (L_mod and E_pts):", "Плотность чарта (NPS) и объективная сложность в баллах (без лимита)": "Chart Density (NPS) & Objective Difficulty Points (Uncapped)", "5. Итоговый балл SDP и перевод в честные звёзды (Auto ★):": "5. Final SDP score and conversion to true difficulty (Auto ★):", "8 направлений нот ·": "8 note directions ·", "95-й перцентиль: 0.0 н/с": "95th percentile: 0.0 n/s", "Auto ★ = round_0.5(SDP / 65)   (1★ ≈ 65 SDP; 1–5★ белые, 5.5–10★ красные поверх, >10★ невозможная карта)": "Auto ★ = round_0.5(SDP / 65)   (1★ ≈ 65 SDP; 1–5★ white, 5.5–10★ red, >10★ Impossible)", "BPM: 120 ·Множитель чтения: 1.00x": "BPM: 120 · Reading multiplier: 1.00x", "HTML5 Canvas 2D, Web Audio API, встроенный упаковщик ZIP/Deflate (": "HTML5 Canvas 2D, Web Audio API, built-in ZIP/Deflate packer (", "SwipEdit— Редактор карт (.swmap)": "SwipEdit — Map Editor (.swmap)", "WASD / Стрелки / Q E Z C": "WASD / Arrows / Q E Z C", "sdp это что? (what?)": "what is sdp? (what?)", "Δt_i < 0.35 с": "Δt_i < 0.35 s", "Авто-выключение через (с):": "Auto-off after (s):", "Авто-генерация 1280×720": "Auto-generate 1280×720", "Авто-генерация 512×512": "Auto-generate 512×512", "Авто-синхронизация": "Auto-sync", "Автоматически прятать комбо (": "Automatically hide combo (", "Автономный веб-редактор карт": "Standalone web map editor", "Артист (artist)": "Artist (artist)", "Ассеты архива .swmap": ".swmap archive assets", "Аудио:": "Audio:", "Базовая скорость скролла и BPM (chart.json)": "Base scroll speed and BPM (chart.json)", "Базовый BPM": "Base BPM", "Баллы сложности (SDP)": "Difficulty points (SDP)", "Без верхнего лимита": "No upper limit", "Быстрые кнопки шейдеров FX_*": "Quick shader buttons FX_*", "Быстрый штамп эффекта на курсор:": "Quick effect stamp at cursor:", "В meta.json: 0.5 ★": "In meta.json: 0.5 ★", "В отличие от ручного поля": "Unlike the manual field", "ВКЛАДКА НОТ И ИНСПЕКТОРА (ДЛЯ ТАБОВОГО РЕЖИМА И МОБИЛОК)": "NOTES & INSPECTOR TAB (FOR TAB MODE AND MOBILE)", "Время": "Time", "Время (с)": "Time (s)", "Все 3 плейлиста из игры:": "All 3 playlists from the game:", "Все события": "All events", "Встроенная библиотека всех 3 официальных плейлистов (24 карты с обложками и песнями)": "Built-in library of all 3 official playlists (24 maps with covers and songs)", "Выделено: 0": "Selected: 0", "Генератор надписей по долям": "Text generator by beats", "Горячие клавиши:": "Hotkeys:", "Готов к работе.": "Ready.", "Двойной клик по дорожке — поставить ноту/эффект · Перетаскивание мышью — сдвиг времени · ПКМ / Delete — удалить · Колесо — прокрутка (Ctrl+колесо — зум)": "Double-click a lane — place note/effect · Drag — shift time · RMB / Delete — remove · Wheel — scroll (Ctrl+wheel — zoom)", "Диагонали: 0% · Смены ≥90°: 0": "Diagonals: 0% · Turns ≥90°: 0", "Динамическая скорость скролла (NOTE_SPEED)": "Dynamic scroll speed (NOTE_SPEED)", "Длительность (с)": "Duration (s)", "Добавить событие / шейдер / надпись": "Add event / shader / text", "Дорожка и камера": "Lane & camera", "Загрузка расчёта текущей карты...": "Calculating current map...", "Идея, сборка и адаптация:": "Idea, build and adaptation:", "Инспектор выбранного элемента": "Selected Item Inspector", "Инспектор выбранной ноты или ивента": "Selected note or event inspector", "Исходный код": "Source code", "Карточка трека (meta.json)": "Track card (meta.json)", "Кликни по ноте или событию на таймлайне для тонкой правки (ПКМ или Delete — удалить).": "Click a note or event on the timeline for fine editing (RMB or Delete — remove).", "Короткие спам-карты (<30 с) штрафуются множителем": "Short spam maps (<30 s) are penalized by a multiplier", "Кто делал": "Who made it", "Масштаб:": "Zoom:", "Микро-сдвиг ноты:": "Micro-shift note:", "Микшер громкости: BGM, Хитсаунды, Метроном": "Volume mixer: BGM, Hitsounds, Metronome", "Микшер звука ниже ↓": "Audio mixer below ↓", "Множитель speed": "Speed multiplier", "НИЖНИЙ ДОК ТАЙМЛАЙНА": "TIMELINE BOTTOM DOCK", "На телефоне удобнее всего ставить ноты прямо на": "On a phone it's easiest to place notes directly on", "Название (title)": "Title (title)", "Не загружено (синтезатор)": "Not loaded (synth)", "Нот:": "Notes:", "Ноты, скорость, эффекты и надписи": "Notes, speed, effects and text", "Обложка:": "Cover:", "Оригинальная игра": "Original game", "Отмена": "Cancel", "Очистить ноты": "Clear notes", "ПАНЕЛЬ АНАЛИТИКИ ПЛОТНОСТИ ЧАРТА (NPS) И БЕЗЛИМИТНОЙ СЛОЖНОСТИ В БАЛЛАХ": "CHART DENSITY (NPS) AND NO-LIMIT DIFFICULTY ANALYTICS PANEL", "ПРАВАЯ КОЛОНКА: НОТЫ, ЭФФЕКТЫ, СКОРОСТЬ СКРОЛЛА И НАДПИСИ ВМЕСТО КОМБО": "RIGHT COLUMN: NOTES, EFFECTS, SCROLL SPEED AND TEXT INSTEAD OF COMBO", "Палитра нот (8 свайпов + реверс)": "Note palette (8 swipes + reverse)", "Панель вкладок (основная навигация на телефонах + переключатель Вкладки / Плитки для ПК)": "Tab bar (main navigation on phones + Tabs / Tiles switch for PC)", "Параметры": "Settings", "Пик 1с:": "Peak 1s:", "Пиковый NPS (Макс 1с / 3с)": "Peak NPS (Max 1s / 3s)", "Плейлист": "Playlist", "Плотность чарта (NPS) и объективная сложность в баллах (SDP)": "Chart density (NPS) and objective difficulty in points (SDP)", "По всему треку: 0.00 н/с": "Whole track: 0.00 n/s", "Подлёт ноты (мс)": "Note approach (ms)", "Попап с объяснением формулы SDP для демон-листа / невозможных уровней": "Popup explaining the SDP formula for the demon list / impossible levels", "Поставить на курсор": "Place at cursor", "Превью карты": "Map preview", "Привязка:": "Snap:", "Пуск/Пауза ·": "Play/Pause ·", "Разбивает строку по словам или через": "Splits the line by words or using", "Размер:": "Time Sig:", "Распространяется под лицензией": "Distributed under license", "Реверс-ноты ·": "Reverse notes ·", "Свободно": "Free", "Свой множитель NOTE_SPEED:": "Custom NOTE_SPEED multiplier:", "Свой…": "Custom…", "Своя…": "Custom…", "Сдвиг сетки (gridOffset, с)": "Grid offset (gridOffset, s)", "Скорость:": "Speed:", "Скролл и Темп": "Scroll & Tempo", "Сложность (0.5–10 ★)": "Difficulty (0.5–10 ★)", "Сложность:": "Difficulty:", "Событий:": "Events:", "Список событий на карте": "Map event list", "Ср. NPS:": "Avg NPS:", "Средний NPS (активный)": "Average NPS (active)", "Ставить кликом": "Place on click", "Стаки и Реверсы": "Stacks & Reverses", "Тайминг и базовая скорость скролла": "Timing and base scroll speed", "Таймлайн": "Timeline", "Текст надписи": "Text content", "Тип": "Type", "Тип ивента": "Event type", "Только NOTE_SPEED": "NOTE_SPEED only", "Только TEXT": "TEXT only", "Только шейдеры FX_*": "FX_* shaders only", "Точки смены BPM (timing[])": "BPM change points (timing[])", "Точки темпа (timing[])": "Tempo points (timing[])", "Транспорт-панель": "Transport panel", "Трек / Карта": "Track / Map", "Файлы внутри .swmap": "Files inside .swmap", "Фон (картинка /": "Background (image /", "Цвет меню (hex)": "Menu color (hex)", "Цвет надписи": "Text color", "Честные звёзды (Auto ★)": "True difficulty (Auto ★)", "Что было использовано": "What was used", "Шаг между словами": "Gap between words", "Шаг по сетке ·": "Grid step ·", "в": "in", "вертикальный стак": "vertical stack", "видео):": "video):", "вместо комбо-счётчика строго в бит начиная с курсора:": "instead of the combo counter, strictly on the beat starting at the cursor:", "внизу (режим": "at the bottom (mode", "вычисляется напрямую из геометрии и таймингов чарта и": "is calculated directly from the chart's geometry and timings and", "генератор надписей": "text generator", "задаёт базовую скорость подлёта (1000 мс по умолчанию), а динамические ускорения/замедления внутри трека ставятся событием": "sets the base approach speed (1000 ms by default), while dynamic speed-ups/slow-downs within the track are set by the event", "значок лицензии": "license badge", "и": "and", "и выставляется автором вручную), оценка": "and set manually by the author), rating", "и выставляется автором вручную), рейтинг": "and set manually by the author), rating", "и расставляет серию ивентов": "and places a series of events", "кредиты кредитная карта": "credits, credit card", "левая колонка": "left column", "не имеет верхнего потолка": "has no upper cap", "палитра нот": "note palette", "панель с аналитикой": "analytics panel", "перед фразой и": "before the phrase and", "после, как в Hi-Tech)": "after, as in Hi-Tech)", "рабочая область": "workspace", "редактор событий": "event editor", "смена скорости прокрутки (с кастомным значением)": "scroll speed change (with custom value)", "смещение": "offset", "события на карте": "events on the map", "центр": "center", "шапка": "header", "— наличие диагонального свайпа (": "— presence of a diagonal swipe (", "— нота": "— note", "— резкий разворот направления между соседними нотами при интервале": "— sharp direction reversal between adjacent notes at an interval of", "— специально для ранжирования челленджей и листа невозможных уровней.": "— specifically for ranking challenges and the impossible levels list.", "— число нот в вертикальном стаке на одном таймкоде (": "— number of notes in a vertical stack on one timecode (", "— это позволяет объективнее оценивать сложность у множества карт.": "— this allows a more objective difficulty rating for many maps.", "↶ Отмена": "↶ Undo", "↷ Повтор": "↷ Redo", "⇄ Зеркало Г": "⇄ Mirror H", "⇅ Зеркало В": "⇅ Mirror V", "≤ 5 мс": "≤ 5 ms", "⏪ -10мс": "⏪ -10ms", "⏱ Метроном:": "⏱ Metronome:", "⏹ Стоп": "⏹ Stop", "▶ Пуск": "▶ Play", "◀ -1мс": "◀ -1ms", "★ Записать расчётные звёзды в meta.json": "★ Apply true difficulty to meta.json", "☑ Все": "☑ All", "⚡ Авто BPM": "⚡ Auto BPM", "⚡ Пик волны (Onset)": "⚡ Waveform peak (Onset)", "⚡ Поставить событие на курсор": "⚡ Place event at cursor", "✎ Правка": "✎ Edit", "✕ Сброс": "✕ Clear", "✨ Демо": "✨ Demo", "✨ События и FX": "✨ Events & FX", "❓ Как считается SDP (Формула)": "❓ How SDP is calculated (Formula)", "⧉ Дублировать": "⧉ Duplicate", "⬚ Выделение (Рамка/Группа)": "⬚ Select (Box/Group)", "🌌 Фон / .ogv": "🌌 BG / .ogv", "🎓 Обучающие паузы из туториала (": "🎓 Tutorial training pauses (", "🎬 Видео-фон в превью": "🎬 Video BG in Preview", "🎬 Превью": "🎬 Preview", "🎵 Загрузить": "🎵 Load", "🎵 Информация": "🎵 Info", "🎵 Музыка:": "🎵 Music:", "🎵 Официальный саундтрек (24 карты)": "🎵 Official soundtrack (24 maps)", "🎹 Набивка нот, стаки и микро-тайминг": "🎹 Note filling, stacks & micro-timing", "🎹 Пиано-ролл (10 рядов)": "🎹 Piano Roll (10 lanes)", "🎹 Смещение": "🎹 Offset", "👁 Превью-видео": "👁 Preview Video", "💬 Разложить фразу по битам": "💬 Split phrase by beats", "💾 Скачать .swmap": "💾 Download .swmap", "📂 Открыть .swmap": "📂 Open .swmap", "📂 Открыть в редакторе": "📂 Open in editor", "📈 График плотности нот по секундам (клик по пику — переход к дропу)": "📈 Note density chart per second (click a peak — jump to the drop)", "📊 Статистика": "📊 Stats", "📏 Компактно (1 ряд)": "📏 Compact (1 lane)", "📐 Формула объективной сложности SDP (SwipEdit Difficulty Points)": "📐 Objective difficulty formula SDP (SwipEdit Difficulty Points)", "📐 Формула объективной сложности SDP (SwipEdit's Difficulty Points)": "📐 Objective difficulty formula SDP (SwipEdit's Difficulty Points)", "📚 Режим стака": "📚 Stack mode", "📥 Скачать .swmap": "📥 Download .swmap", "🔍 Проверить карту": "🔍 Check map", "🔴 Запись": "🔴 Record", "🖐 Прокрутка / Зум": "🖐 Scroll / Zoom", "🖥 Режим: Плитки / Вкладки": "🖥 Mode: Tiles / Tabs", "🖼 Обложка": "🖼 Cover", "🗑 Удалить": "🗑 Delete", "🗑 Удалить выбранное": "🗑 Delete selected", "🥁 Хитсаунд:": "🥁 Hitsound:", "🧲 Сетка + Пик": "🧲 Grid + Peak", "🧹 Ластик": "🧹 Eraser", "Автоматически определить BPM и сдвиг сетки (gridOffset) по загруженному аудио": "Automatically detect BPM and grid offset (gridOffset) from the loaded audio", "Базовое время прилёта ноты от края к центру в миллисекундах (меньше = быстрее базовый скролл)": "Base note travel time from edge to center in milliseconds (lower = faster base scroll)", "Вид дорожки нот: 10-рядный Пиано-ролл (удобно для телефонов и стаков) или Компактно (1 ряд)": "Lane view: 10-lane Piano Roll (handy for phones and stacks) or Compact (1 lane)", "Включает обучающие паузы из 1.1 (tutorial_controller.gd) на первой обычной и первой реверс-ноте карты": "Enables tutorial pauses from 1.1 (tutorial_controller.gd) on the map's first normal and first reverse note", "Включить и настроить громкость метронома по сетке BPM (до 200% усиления)": "Enable and set metronome volume on the BPM grid (up to 200% boost)", "Включить и настроить громкость хитсаундов нот (до 200% усиления)": "Enable and set note hitsound volume (up to 200% boost)", "Выделить все ноты и события карты (Ctrl+A)": "Select all notes and events on the map (Ctrl+A)", "Громкость музыки (BGM)": "Music volume (BGM)", "Дублировать выделенные ноты/ивенты вперёд на 1 долю (Ctrl+D)": "Duplicate selected notes/events forward by 1 beat (Ctrl+D)", "Загрузить демо-карту из 1.1 (Tutorial — Arvicheskyy)": "Load the demo map from 1.1 (Tutorial — Arvicheskyy)", "Загрузить фоновую картинку (.png/.jpg/.webp) или готовый видео-фон .ogv напрямую в архив .swmap без перекодирования": "Load a background image (.png/.jpg/.webp) or a ready video background .ogv directly into the .swmap archive without re-encoding", "Закрыть": "Close", "Записать расчётные звёзды сложности в поле difficulty (meta.json, макс. 10★)": "Write accurate difficulty stars to the difficulty field (meta.json, max 10★)", "Знаменатель: длительность одной доли (4 = четверть, 8 = восьмая)": "Denominator: length of one beat (4 = quarter, 8 = eighth)", "Имя аудиофайла в chart.json": "Audio file name in chart.json", "Имя файла обложки в chart.json": "Cover file name in chart.json", "Имя фонового файла в chart.json (например bg.png или bg.ogv)": "Background file name in chart.json (e.g. bg.png or bg.ogv)", "Кастомная скорость воспроизведения (0.10x – 4.00x)": "Custom playback speed (0.10x – 4.00x)", "Надпись": "Text", "Нажимай в ритм для определения BPM": "Tap in rhythm to detect BPM", "Наслаивать ноты разных направлений в один вертикальный стак на одном таймкоде": "Stack notes of different directions into one vertical stack on the same timecode", "Объективная сложность чарта в баллах (без лимита)": "Objective chart difficulty in points (no limit)", "Опционально: если мобильный браузер не декодирует Ogg Theora (.ogv) в превью, подставь любой .mp4/.webm чисто для предпросмотра (в .swmap уйдёт твой .ogv)": "Optional: if the mobile browser can't decode Ogg Theora (.ogv) in the preview, use any .mp4/.webm just for preview (your .ogv will still go into the .swmap)", "Отзеркалить все ноты по вертикали": "Mirror all notes vertically", "Отзеркалить все ноты по горизонтали": "Mirror all notes horizontally", "Отзеркалить выделенные ноты по вертикали": "Mirror selected notes vertically", "Отзеркалить выделенные ноты по горизонтали": "Mirror selected notes horizontally", "Открыть подробный разбор математической формулы SDP и расчёт по текущей карте": "Open a detailed breakdown of the SDP math formula and the calculation for the current map", "Открыть существующий .swmap или перетащить файл на страницу": "Open an existing .swmap or drag the file onto the page", "Отменить (Ctrl+Z)": "Undo (Ctrl+Z)", "Переключить раскладку: Вкладки (мобильная) / Плитки (ПК)": "Switch layout: Tabs (mobile) / Tiles (PC)", "Повторить (Ctrl+Y)": "Redo (Ctrl+Y)", "Подпись SwipEdit проверена: карта создана в SwipEdit": "SwipEdit signature verified: map was created in SwipEdit", "Показывать видео-фон (.ogv) на канвасе превью (выключи на слабом смартфоне, если тормозит декодирование видео)": "Show video background (.ogv) on the preview canvas (turn off on a weak phone if video decoding lags)", "Пресет скорости воспроизведения": "Playback speed preset", "Проверить карту на ошибки перед сохранением": "Check the map for errors before saving", "Разделы редактора": "Editor sections", "Регулировка громкости превью": "Preview volume adjustment", "Режим живой записи (свайпы и клавиши ставят ноты на лету под музыку)": "Live recording mode (swipes and keys place notes on the fly to the music)", "Режим касания пальцем / мышью по таймлайну": "Finger / mouse touch mode on the timeline", "Скачать отдельно chart.json и meta.json": "Download chart.json and meta.json separately", "Слова через пробел или |": "Words separated by space or |", "Снять выделение (Esc)": "Deselect (Esc)", "Собрать и скачать готовый архив .swmap для импорта в Swipetava": "Build and download a ready .swmap archive for import into Swipetava", "Сразу собрать и скачать выбранную официальную карту как .swmap": "Immediately build and download the selected official map as .swmap", "Сразу ставить ноту при клике по кнопке направления": "Place a note immediately when clicking a direction button", "Тактовый размер для метронома и тактовой сетки таймлайна (3/4, 4/4, 5/4, 6/8, 11/8 или любой свой N/M)": "Time signature for the metronome and timeline bar grid (3/4, 4/4, 5/4, 6/8, 11/8 or any custom N/M)", "Удалить все выделенные элементы (Delete)": "Delete all selected items (Delete)", "Цвет серии надписей": "Text series color", "Числитель: число долей в такте": "Numerator: beats per bar", "Шаг вперёд по сетке (])": "Step forward on the grid (])", "Шаг назад по сетке ([)": "Step back on the grid ([)", "${fileName} (${(bytes.byteLength / 1024 / 1024).toFixed(2)} МБ)": "${fileName} (${(bytes.byteLength / 1024 / 1024).toFixed(2)} MB)", "${formatTime(state.currentTime)} / ${formatTime(state.duration)} | Такт ${barIdx}.${beatIdx} (${tsNum}/${tsDen})": "${formatTime(state.currentTime)} / ${formatTime(state.duration)} | Bar ${barIdx}.${beatIdx} (${tsNum}/${tsDen})", "${scopeTxt} отзеркалены по вертикали (↑ ↔ ↓)": "${scopeTxt} mirrored vertically (↑ ↔ ↓)", "${scopeTxt} отзеркалены по горизонтали (← ↔ →)": "${scopeTxt} mirrored horizontally (← ↔ →)", "${st.avgNps.toFixed(2)} н/с": "${st.avgNps.toFixed(2)} n/s", "${st.minEffTravelMs} мс (${st.maxSpeed.toFixed(2)}x)": "${st.minEffTravelMs} ms (${st.maxSpeed.toFixed(2)}x)", "${st.stacksCount} (макс ×${st.maxStackSize}) / ${st.reversesCount}": "${st.stacksCount} (max ×${st.maxStackSize}) / ${st.reversesCount}", ", трек загружен!": ", track loaded!", "95-й перцентиль: ${st.p95Nps.toFixed(1)} н/с": "95th percentile: ${st.p95Nps.toFixed(1)} n/s", ": '(мгнов.)'}": ": '(instant)'}", "<button type=\"button\" class=\"pad-btn pad-center\" id=\"btn-place-active-note\" title=\"Поставить выбранную ноту на текущий таймкод\">Поставить</button>": "<button type=\"button\" class=\"pad-btn pad-center\" id=\"btn-place-active-note\" title=\"Place the selected note on the current timecode\">Place</button>", "<div class=\"muted-hint\">Кликни по любой ноте или событию на таймлайне (или в таблице справа), чтобы изменить его точное время, направление, текст, цвет или скорость. Правый клик или клавиша <code>Delete</code> удаляет элемент.</div>": "<div class=\"muted-hint\">Click any note or event on the timeline (or in the table on the right) to change its exact time, direction, text, color or speed. Right-click or the <code>Delete</code> key removes the item.</div>", "<label>Длительность duration (сек)\n            <input type=\"number\" id=\"insp-ev-duration\" step=\"0.05\" min=\"0.05\" value=\"${item.duration !== undefined ? item.duration : (def.defaultDuration || 0.5)}\" />\n          </label>": "<label>Duration (sec)\n            <input type=\"number\" id=\"insp-ev-duration\" step=\"0.05\" min=\"0.05\" value=\"${item.duration !== undefined ? item.duration : (def.defaultDuration || 0.5)}\" />\n          </label>", "<label>Множитель скорости speed\n            <input type=\"number\" id=\"insp-ev-speed\" step=\"0.05\" min=\"0.1\" max=\"10\" value=\"${item.speed !== undefined ? item.speed : 1.5}\" />\n          </label>": "<label>Speed multiplier speed\n            <input type=\"number\" id=\"insp-ev-speed\" step=\"0.05\" min=\"0.1\" max=\"10\" value=\"${item.speed !== undefined ? item.speed : 1.5}\" />\n          </label>", "<label>Надпись (text)\n            <input type=\"text\" id=\"insp-ev-text\" value=\"${escapeHtml(item.text || '')}\" />\n          </label>": "<label>Text (text)\n            <input type=\"text\" id=\"insp-ev-text\" value=\"${escapeHtml(item.text || '')}\" />\n          </label>", "<label>Цвет (color)\n            <input type=\"color\" id=\"insp-ev-color\" value=\"${item.color || def.defaultColor || '#ffffff'}\" />\n          </label>": "<label>Color (color)\n            <input type=\"color\" id=\"insp-ev-color\" value=\"${item.color || def.defaultColor || '#ffffff'}\" />\n          </label>", "<option value=\"${escapeHtml(item.uid)}\" ${isHiTech ? 'selected' : ''}>[${escapeHtml(item.playlistId)}] ${escapeHtml(title)} — ${escapeHtml(artist)} (${bpm} BPM · ${nLen} нот · ${eLen} ив.)</option>": "<option value=\"${escapeHtml(item.uid)}\" ${isHiTech ? 'selected' : ''}>[${escapeHtml(item.playlistId)}] ${escapeHtml(title)} — ${escapeHtml(artist)} (${bpm} BPM · ${nLen} notes · ${eLen} ev.)</option>", "<option value=\"ALL\">Все 3 плейлиста (${allPlaylistSongs.length} карт)</option>": "<option value=\"ALL\">All 3 playlists (${allPlaylistSongs.length} maps)</option>", "BG_COLOR (Смена цвета фона)": "BG_COLOR (Background color change)", "BLACKOUT (Затемнение)": "BLACKOUT (Blackout)", "BPM ${tp.bpm} | SPEED ${st.speed}x (${effMs}мс) | ${st.flowLeft ? '← LEFT' : 'RIGHT →'}": "BPM ${tp.bpm} | SPEED ${st.speed}x (${effMs}ms) | ${st.flowLeft ? '← LEFT' : 'RIGHT →'}", "BPM: ${state.chart.bpm} · Множитель чтения: ${st.speedModAvg.toFixed(2)}x": "BPM: ${state.chart.bpm} · Reading multiplier: ${st.speedModAvg.toFixed(2)}x", "CAMERA_BOB_OFF (Качание камеры ВЫКЛ)": "CAMERA_BOB_OFF (Camera bob OFF)", "CAMERA_BOB_ON (Качание камеры ВКЛ)": "CAMERA_BOB_ON (Camera bob ON)", "DISCO (Неоновая диско-подсветка)": "DISCO (Neon disco lights)", "FLASH (Вспышка мгновенная / долгая)": "FLASH (Flash instant / long)", "FX / КАМЕРА": "FX / CAMERA", "FX_AQUA (Подводный аква-шейдер)": "FX_AQUA (Underwater aqua shader)", "FX_ASH_WIND (Пепельный ветер)": "FX_ASH_WIND (Ash wind)", "FX_BW (Чёрно-белый)": "FX_BW (Black & white)", "FX_DREAD (Тени с краёв / Dread)": "FX_DREAD (Edge shadows / Dread)", "FX_DUOTONE (Дуотон)": "FX_DUOTONE (Duotone)", "FX_ENDING (Кинематографичный финал / интро)": "FX_ENDING (Cinematic ending / intro)", "FX_GLITCH (Глитч полосами)": "FX_GLITCH (Striped glitch)", "FX_HALFTONE (Полутоновый растр)": "FX_HALFTONE (Halftone screen)", "FX_INVERT (Инверсия цветов)": "FX_INVERT (Color invert)", "FX_OLD_TV (Старый ТВ / CRT)": "FX_OLD_TV (Old TV / CRT)", "FX_PIXELATE (Пикселизация)": "FX_PIXELATE (Pixelate)", "FX_POSTERIZE (Постеризация)": "FX_POSTERIZE (Posterize)", "FX_RGB_SPLIT (Хроматический RGB-раскол)": "FX_RGB_SPLIT (Chromatic RGB split)", "FX_WAVE (Волновое искажение)": "FX_WAVE (Wave distortion)", "FX_ZOOM_BLUR (Зум-блюр)": "FX_ZOOM_BLUR (Zoom blur)", "HUD_HIDE (Скрыть комбо / HUD)": "HUD_HIDE (Hide combo / HUD)", "HUD_SHOW (Показать комбо / HUD)": "HUD_SHOW (Show combo / HUD)", "NOTES_BOUNCE_OFF (Прыжки нот ВЫКЛ)": "NOTES_BOUNCE_OFF (Note bounce OFF)", "NOTES_BOUNCE_ON (Прыжки нот ВКЛ)": "NOTES_BOUNCE_ON (Note bounce ON)", "NOTES_FLOW_LEFT (Поток влево ←)": "NOTES_FLOW_LEFT (Flow left ←)", "NOTES_FLOW_RIGHT (Поток вправо →)": "NOTES_FLOW_RIGHT (Flow right →)", "NOTES_SPIN_OFF (Вращение нот ВЫКЛ)": "NOTES_SPIN_OFF (Note spin OFF)", "NOTES_SPIN_ON (Вращение нот ВКЛ)": "NOTES_SPIN_ON (Note spin ON)", "NOTES_WAVE_OFF (Волна нот ВЫКЛ)": "NOTES_WAVE_OFF (Note wave OFF)", "NOTES_WAVE_ON (Волна нот ВКЛ)": "NOTES_WAVE_ON (Note wave ON)", "NOTE_PUSH_OFF (Толчок нот ВЫКЛ)": "NOTE_PUSH_OFF (Note push OFF)", "NOTE_PUSH_ON (Толчок нот ВКЛ)": "NOTE_PUSH_ON (Note push ON)", "NOTE_SPEED (Скорость скролла)": "NOTE_SPEED (Scroll speed)", "SHAKE (Тряска экрана)": "SHAKE (Screen shake)", "TEXT (Надпись вместо комбо)": "TEXT (Text instead of combo)", "Tap Tempo: ${bpm} BPM (${tapTimes.length} нажатий)": "Tap Tempo: ${bpm} BPM (${tapTimes.length} taps)", "Tap Tempo: продолжай нажимать в такт...": "Tap Tempo: keep tapping in time...", "АУДИО ВОЛНА": "AUDIO WAVE", "Авто-BPM: определён темп ${bestBpm} BPM, сдвиг сетки ${offsetSec.toFixed(3)} сек": "Auto-BPM: tempo detected ${bestBpm} BPM, grid offset ${offsetSec.toFixed(3)} sec", "В meta.json: ${state.meta.difficulty} ★ ${renderSwipetavaStarsHtml(state.meta.difficulty)}": "In meta.json: ${state.meta.difficulty} ★ ${renderSwipetavaStarsHtml(state.meta.difficulty)}", "В архиве .swmap не найден обязательный файл chart.json": "Required file chart.json not found in the .swmap archive", "ВОЛНА": "WAVE", "Введи слова через пробел или | для раскидки по битам": "Enter words separated by space or | to spread them across beats", "Видео-фон скрыт в превью (для экономии ресурсов смартфона; в архиве .swmap он сохранится)": "Video background hidden in preview (to save phone resources; it will be kept in the .swmap archive)", "Включены обучающие паузы из туториала (\"tutorial\": \"first_swipe\" на 1-й обычной и 1-й реверс-ноте)": "Tutorial training pauses enabled (\"tutorial\": \"first_swipe\" on the 1st normal and 1st reverse note)", "Возвращает счётчик комбо и интерфейс после серии надписей TEXT (как на карте Hi-Tech)": "Brings back the combo counter and UI after a TEXT series (as on the Hi-Tech map)", "Все ноты": "All notes", "Выбрана дорожка ноты: ${hit.noteType}": "Note lane selected: ${hit.noteType}", "Выводит кастомную надпись в зоне комбо/оценки (как на карте Hi-Tech и в интро)": "Shows a custom text in the combo/rating area (as on the Hi-Tech map and in the intro)", "Выделение (проведи рамкой по нотам или тапай по ним, затем перетащи любую выделенную ноту для сдвига всей группы)": "Selection (draw a box over notes or tap them, then drag any selected note to shift the whole group)", "Выделение снято": "Selection cleared", "Выделенные ноты (${targetNotes.length})": "Selected notes (${targetNotes.length})", "Выделено рамкой: ${state.selectedNotes.size} нот, ${state.selectedEvents.size} событий": "Box-selected: ${state.selectedNotes.size} notes, ${state.selectedEvents.size} events", "Выделено: ${nCnt} нот, ${eCnt} событий": "Selected: ${nCnt} notes, ${eCnt} events", "Выделены все элементы: ${state.selectedNotes.size} нот, ${state.selectedEvents.size} событий": "All items selected: ${state.selectedNotes.size} notes, ${state.selectedEvents.size} events", "Выключает вертикальные прыжки нот": "Turns off vertical note bounce", "Выключает волновое движение нот": "Turns off note wave motion", "Выключает вращение нот": "Turns off note spin", "Выключает импульсный толчок нот": "Turns off note push pulse", "Готово! Скачан архив ${safeName}.swmap (${(zipBytes.byteLength / 1024 / 1024).toFixed(2)} МБ)": "Done! Downloaded archive ${safeName}.swmap (${(zipBytes.byteLength / 1024 / 1024).toFixed(2)} MB)", "Движение нот, реверс дорожки и камера": "Note motion, lane reverse and camera", "Двухцветный контрастный градиент": "Two-tone high-contrast gradient", "Диагонали: ${st.diagPct}% · Смены ≥90°: ${st.sharpTurns}": "Diagonals: ${st.diagPct}% · Turns ≥90°: ${st.sharpTurns}", "Длина: ${st.activeSpan.toFixed(1)}с (множитель длины ×${st.lengthMod.toFixed(2)})": "Length: ${st.activeSpan.toFixed(1)}s (length multiplier ×${st.lengthMod.toFixed(2)})", "Для Авто-BPM сначала загрузи аудиофайл или выбери карту из плейлиста": "For Auto-BPM, first load an audio file or pick a map from a playlist", "Добавлен эффект ${fxType} на ${t.toFixed(3)} сек": "Effect ${fxType} added at ${t.toFixed(3)} sec", "Добавлена серия из ${parts.length} надписей TEXT по битам": "Added a series of ${parts.length} TEXT labels by beats", "Загружен видео-фон ${f.name} → сохранён как ${targetBgName} в .swmap без перекодирования": "Video background ${f.name} loaded → saved as ${targetBgName} in .swmap without re-encoding", "Загружен фон ${f.name}": "Background ${f.name} loaded", "Загружена демо-карта «${state.meta.title}» — ${state.meta.artist} (${state.chart.notes.length} нот, ${state.chart.events.length} событий)": "Demo map «${state.meta.title}» — ${state.meta.artist} loaded (${state.chart.notes.length} notes, ${state.chart.events.length} events)", "Загружена карта \"${state.meta.title}\" — ${state.chart.notes.length} нот, ${state.chart.events.length} событий": "Loaded map \"${state.meta.title}\" — ${state.chart.notes.length} notes, ${state.chart.events.length} events", "Загружена карта «${state.meta.title}» (${entry.playlistId}) — ${state.chart.notes.length} нот, ${state.chart.events.length} событий": "Loaded map «${state.meta.title}» (${entry.playlistId}) — ${state.chart.notes.length} notes, ${state.chart.events.length} events", "Загружена обложка ${f.name}": "Cover ${f.name} loaded", "Загружено аудио ${f.name}": "Audio ${f.name} loaded", "Загружено видео ${f.name} для превью (в самой игре Swipetava поддерживается .ogv)": "Video ${f.name} loaded for preview (the Swipetava game itself supports .ogv)", "Импульсное подёргивание дорожки нот на каждую долю": "Pulsing jerk of the note lane on every beat", "Камера ритмично покачивается и пульсирует в такт BPM": "Camera sways and pulses rhythmically in time with the BPM", "Карта подписана скрытой меткой SwipEdit (${wmTag}) внутри JSON и ZIP.": "The map is signed with a hidden SwipEdit mark (${wmTag}) inside the JSON and ZIP.", "Карта создана в SwipEdit (скрытая подпись активна)": "Map created in SwipEdit (hidden signature active)", "Комиксный точечный растр поверх сцены": "Comic dot-screen overlay on the scene", "Ластик (тап по ноте или событию удаляет его)": "Eraser (tap a note or event to delete it)", "Меняет множитель скорости полёта нот (1 = базовая, 1.25 / 1.5 / 2 = быстрее)": "Changes the note flight speed multiplier (1 = base, 1.25 / 1.5 / 2 = faster)", "Меняет цвет фона карты: при duration = 0 мгновенно, при duration > 0 плавно переливает к выбранному цвету": "Changes the map background color: instantly at duration = 0, smoothly fades to the chosen color at duration > 0", "НОТЫ": "NOTES", "НОТЫ / СТАКИ": "NOTES / STACKS", "Надписи вместо комбо и скорость скролла": "Text instead of combo and scroll speed", "Негатив экрана на время duration": "Screen negative for duration", "Нота ${noteType} поставлена на ${t.toFixed(3)} сек${stackCount > 1 ?": "Note ${noteType} placed at ${t.toFixed(3)} sec${stackCount > 1 ?", "Ноты начинают прыгать вверх-вниз по синусоиде в такт биту": "Notes start bouncing up and down in a sine wave in time with the beat", "Ноты непрерывно вращаются вокруг своей оси во время полёта (из карт SwipeTrava и Ew.mp3)": "Notes spin continuously around their axis during flight (from the SwipeTrava and Ew.mp3 maps)", "Обесцвечивание с повышенным контрастом": "Desaturation with increased contrast", "Обучающие паузы туториала выключены": "Tutorial training pauses disabled", "Останавливает покачивание камеры": "Stops camera sway", "Отменено последнее действие": "Last action undone", "Отрисовка видео-фона (.ogv) в превью включена": "Video background (.ogv) rendering in preview enabled", "Официальная демо-карта Tutorial (v1.1), подписана в SwipEdit.": "Official Tutorial demo map (v1.1), signed in SwipEdit.", "Официальная карта «${state.meta.title}» из встроенной библиотеки SwipEdit.": "Official map «${state.meta.title}» from the built-in SwipEdit library.", "Очистить все ноты на карте?": "Clear all notes on the map?", "Ошибка конвертации .ctex: ${err.message}": "Conversion error .ctex: ${err.message}", "Ошибка конвертации .oggvorbisstr: ${err.message}": "Conversion error .oggvorbisstr: ${err.message}", "Ошибка сборки .swmap: ${err.message}": "Error building .swmap: ${err.message}", "Ошибка чтения .swmap: ${err.message}": "Error reading .swmap: ${err.message}", "Ошибка чтения .swmap:\\n${err.message}": "Error reading .swmap:\\n${err.message}", "По всему треку (${st.totalLength.toFixed(0)}с): ${st.totalNps.toFixed(2)} н/с": "Whole track (${st.totalLength.toFixed(0)}s): ${st.totalNps.toFixed(2)} n/s", "Повторено отменённое действие": "Undone action redone", "Погружает экран в темноту на указанное время (duration)": "Plunges the screen into darkness for the given time (duration)", "Подводное преломление с мягкими аква-волнами и бликами (из карты swtv)": "Underwater refraction with soft aqua waves and glints (from the swtv map)", "Подключено превью-видео ${f.name} (в архиве .swmap остаётся ${state.chart.backgroundFile})": "Preview video ${f.name} connected (the .swmap archive keeps ${state.chart.backgroundFile})", "Поставлен кастомный NOTE_SPEED = ${spd}x на ${t.toFixed(3)} сек": "Custom NOTE_SPEED = ${spd}x placed at ${t.toFixed(3)} sec", "Поставлено событие NOTE_SPEED = ${spd}x на ${t.toFixed(3)} сек": "NOTE_SPEED = ${spd}x event placed at ${t.toFixed(3)} sec", "Поставь ноты на карту, чтобы увидеть график плотности NPS по секундам": "Place notes on the map to see the NPS density chart per second", "Поток летящих нот изгибается плавной синусоидальной волной (из карт SwipeTrava и Ew.mp3)": "The flow of flying notes bends in a smooth sine wave (from the SwipeTrava and Ew.mp3 maps)", "Правка (тап по ряду в Пиано-ролле сразу ставит/убирает ноту или собирает стак)": "Edit (tapping a row in the Piano Roll instantly places/removes a note or builds a stack)", "Проверка карты: всё чисто!": "Map check: all clear!", "Проверка карты: найдено ${issues.length} замечаний": "Map check: ${issues.length} issues found", "Прокрутка (1 палец — двигать дорожку, 2 пальца — зум)": "Scroll (1 finger — move the lane, 2 fingers — zoom)", "Пульсирующие тени с краёв экрана с хроматическим сдвигом и зерном": "Pulsing edge shadows with chromatic shift and grain", "Радиальное размытие и зум к центру": "Radial blur and zoom toward the center", "Распаковка ${file.name}...": "Unpacking ${file.name}...", "Реверс дорожки: линия удара переезжает влево, ноты летят справа налево": "Lane reverse: the hit line moves left, notes fly right to left", "Режим живой записи включён: запусти трек и нажимай кнопки направлений (или клавиши WASD/стрелки) в такт!": "Live recording mode on: start the track and press the direction buttons (or WASD/arrow keys) in time!", "Режим живой записи выключен": "Live recording mode off", "Режим таймлайна: ${titles[state.timelineTouchMode] || state.timelineTouchMode}": "Timeline mode: ${titles[state.timelineTouchMode] || state.timelineTouchMode}", "Резкий ударный шейк камеры": "Sharp impact camera shake", "Резкое квантование палитры цветов": "Harsh color palette quantization", "Ретро-пикселизация изображения на время duration (из карты Hi-Tech)": "Retro image pixelation for duration (from the Hi-Tech map)", "Ритмичное переливание неоновых цветов и прожекторов в такт биту на время duration (из карты Hi-Tech)": "Rhythmic shifting of neon colors and spotlights on the beat for duration (from the Hi-Tech map)", "Сдвинуто: ${notesToMove.length} нот, ${eventsToMove.length} ив. на ${deltaSec > 0 ? '+' : ''}${Math.round(deltaSec * 1000)} мс": "Shifted: ${notesToMove.length} notes, ${eventsToMove.length} ev. by ${deltaSec > 0 ? '+' : ''}${Math.round(deltaSec * 1000)} ms", "Сильное расслоение RGB-каналов экрана на время duration (из карты Tearout)": "Strong RGB channel split of the screen for duration (from the Tearout map)", "Синусоидальное искривление экрана": "Sinusoidal screen warp", "Скачан файл chart.json (со скрытой меткой SwipEdit)": "chart.json downloaded (with hidden SwipEdit mark)", "Сконвертирован Godot ${f.name} (${conv.sourceFormat} ${conv.width}×${conv.height}) → Cover.png": "Godot ${f.name} converted (${conv.sourceFormat} ${conv.width}×${conv.height}) → Cover.png", "Сконвертирован Godot ${f.name} → ${conv.fileName} (${conv.packetsCount} пакетов, ${conv.sampleRate} Гц)": "Godot ${f.name} converted → ${conv.fileName} (${conv.packetsCount} packets, ${conv.sampleRate} Hz)", "Скопировано вперёд (+${span.toFixed(3)}с): ${newNotes.length} нот, ${newEvents.length} ивентов": "Copied forward (+${span.toFixed(3)}s): ${newNotes.length} notes, ${newEvents.length} events", "Скорость проигрывания превью: ${rate}x": "Preview playback speed: ${rate}x", "Скрывает счётчик комбо и интерфейс перед появлением кастомных надписей TEXT (как на карте Hi-Tech)": "Hides the combo counter and UI before custom TEXT labels appear (as on the Hi-Tech map)", "Сложность в meta.json установлена по расчёту плотности: ${rounded} ★ (${st.sdpPoints.toFixed(1)} pts)": "Difficulty in meta.json set from density calculation: ${rounded} ★ (${st.sdpPoints.toFixed(1)} pts)", "Сначала выдели одну или несколько нот/событий для дублирования": "First select one or more notes/events to duplicate", "Событие ${typeId} добавлено на ${t.toFixed(3)} сек": "Event ${typeId} added at ${t.toFixed(3)} sec", "Стак-режим включён: новые ноты на том же таймкоде складываются в вертикальный стак": "Stack mode on: new notes on the same timecode stack vertically", "Стак-режим выключен: нота на том же таймкоде заменяет предыдущую (в Пиано-ролле стаки доступны всегда)": "Stack mode off: a note on the same timecode replaces the previous one (stacks are always available in the Piano Roll)", "Стандартное направление: ноты летят слева направо к линии удара": "Standard direction: notes fly left to right toward the hit line", "Т${barNum} (${t.toFixed(2)}s)": "B${barNum} (${t.toFixed(2)}s)", "ТАКТ (${state.timeSigNum}/${state.timeSigDen})": "BAR (${state.timeSigNum}/${state.timeSigDen})", "ТАКТЫ (${state.timeSigNum}/${state.timeSigDen})": "BARS (${state.timeSigNum}/${state.timeSigDen})", "Тактовый размер метронома и сетки: ${n}/${d}": "Metronome and grid time signature: ${n}/${d}", "Трёхслойный пепел на ветру, горячее марево и тёплый пепельный грейд": "Three-layer ash in the wind, hot haze and warm ash grade", "Убрана нота ${noteType} на ${t.toFixed(3)} сек": "Note ${noteType} removed at ${t.toFixed(3)} sec", "Удалено выделенных элементов: ${delCount}": "Selected items deleted: ${delCount}", "Упаковка .swmap архива...": "Packing .swmap archive...", "Цифровой глитч с разрывом полос и сдвигом сканлайнов": "Digital glitch with striped tearing and scanline shift", "Шейдерные пост-эффекты (FX_*)": "Shader post-effects (FX_*)", "Элемент удалён": "Item deleted", "Эффект интро/концовки с кинематографичными полосами и виньеткой": "Intro/ending effect with cinematic bars and vignette", "Эффект старого телевизора со сканлайнами и помехами": "Old TV effect with scanlines and static", "Яркая вспышка: при duration = 0 — короткая ударная, при duration > 0 — долгая плавная (как на Hi-Tech)": "Bright flash: at duration = 0 — short impact, at duration > 0 — long smooth (as on Hi-Tech)", "мгновенный / триггер": "instant / trigger", "ℹ Последний NOTE_SPEED равен ${speedEvs[speedEvs.length - 1].speed}x (не сброшен обратно в 1.0x до конца карты).": "ℹ Last NOTE_SPEED is ${speedEvs[speedEvs.length - 1].speed}x (not reset back to 1.0x until the end of the map).", "ℹ У ноты ${n.type} на ${n.time.toFixed(3)}с нет явного события ${expected} (игра сама добавит его через _heal_missing_reverse_events).": "ℹ Note ${n.type} at ${n.time.toFixed(3)}s has no explicit ${expected} event (the game will add it itself via _heal_missing_reverse_events).", "⏸ Пауза": "⏸ Pause", "⚠ Внимание: реверс на <= 1.0с сработает в игре сразу со старта (EARLY_EVENT_WINDOW)!": "⚠ Warning: a reverse at <= 1.0s will trigger in the game right from the start (EARLY_EVENT_WINDOW)!", "⚠ Дубликат одинаковой ноты ${notes[i].type} в одном стаке на ${notes[i].time.toFixed(3)}с.": "⚠ Duplicate of the same note ${notes[i].type} in one stack at ${notes[i].time.toFixed(3)}s.", "⚠ Нота ${n.type} на ${n.time.toFixed(3)}с стоит в первой секунде (<= 1.0с): из-за EARLY_EVENT_WINDOW в игре дорожка развернётся сразу на 0.0с.": "⚠ Note ${n.type} at ${n.time.toFixed(3)}s is in the first second (<= 1.0s): because of EARLY_EVENT_WINDOW the lane will reverse right at 0.0s in the game.", "⚠ Реверс на <= 1.0 сек: в игре сработает сразу со старта (EARLY_EVENT_WINDOW)": "⚠ Reverse at <= 1.0 sec: will trigger in the game right from the start (EARLY_EVENT_WINDOW)", "⚠ Событие NOTES_FLOW_RIGHT на ${ev.time.toFixed(3)}с (<= 1.0с) развернёт поток сразу при старте уровня.": "⚠ NOTES_FLOW_RIGHT event at ${ev.time.toFixed(3)}s (<= 1.0s) will reverse the flow right at level start.", "✅ Проблем не найдено! Нот: ${notes.length}, стаков: ${state.lastStats ? state.lastStats.stacksCount : 0}, событий: ${events.length}.": "✅ No problems found! Notes: ${notes.length}, stacks: ${state.lastStats ? state.lastStats.stacksCount : 0}, events: ${events.length}.", "🎬 ${state.chart.backgroundFile} (${sizeMb} МБ, упакован в .swmap; для превью в этом браузере можно выбрать 👁 Превью-видео)": "🎬 ${state.chart.backgroundFile} (${sizeMb} MB, packed in .swmap; for preview in this browser you can choose 👁 Preview video)", "🎬 ${state.chart.backgroundFile} (${v.videoWidth}×${v.videoHeight}, ${sizeMb} МБ)": "🎬 ${state.chart.backgroundFile} (${v.videoWidth}×${v.videoHeight}, ${sizeMb} MB)", "🎬 ${state.chart.backgroundFile} + превью ${fileName} (${v.videoWidth}×${v.videoHeight})": "🎬 ${state.chart.backgroundFile} + preview ${fileName} (${v.videoWidth}×${v.videoHeight})", "📐 Вид: Вкладки (Мобильный)": "📐 View: Tabs (Mobile)", "🔴 Другой редактор": "🔴 Other editor", "🔴 ЗАПИСЬ ВКЛ": "🔴 RECORDING ON", "🖥 Вид: Плитки (ПК)": "🖥 View: Tiles (PC)", "🟢 SwipEdit (Офиц. OST)": "🟢 SwipEdit (Official OST)", "🟢 Офиц. OST": "🟢 Official OST", "Скорость, эффекты и надписи": "Speed, effects & captions", "🔄 Авто-синк ": "🔄 Auto-sync ", "🟢 Создано в SwipEdit": "🟢 Made in SwipEdit", "🎮 Превью и Звук": "🎮 Preview & Audio", "🎹 Таймлайн и Ноты": "🎹 Timeline & Notes", "⚡ Эффекты (36)": "⚡ Effects (36)", "🎵 Карта и Плейлисты (24)": "🎵 Map & Playlists (24)", "95-й перцентиль: ": "95th percentile: ", "<label>Длительность duration (сек)\n            <input type=\"number\" id=\"insp-ev-duration\" step=\"0.05\" min=\"0.05\" value=\"": "<label>Duration (sec)\n            <input type=\"number\" id=\"insp-ev-duration\" step=\"0.05\" min=\"0.05\" value=\"", "<label>Множитель скорости speed\n            <input type=\"number\" id=\"insp-ev-speed\" step=\"0.05\" min=\"0.1\" max=\"10\" value=\"": "<label>Speed multiplier speed\n            <input type=\"number\" id=\"insp-ev-speed\" step=\"0.05\" min=\"0.1\" max=\"10\" value=\"", "<label>Надпись (text)\n            <input type=\"text\" id=\"insp-ev-text\" value=\"": "<label>Text (text)\n            <input type=\"text\" id=\"insp-ev-text\" value=\"", "<label>Цвет (color)\n            <input type=\"color\" id=\"insp-ev-color\" value=\"": "<label>Color (color)\n            <input type=\"color\" id=\"insp-ev-color\" value=\"", "<option value=\"": "<option value=\"", "<option value=\"ALL\">Все 3 плейлиста (": "<option value=\"ALL\">All 3 playlists (", "BPM ": "BPM ", "BPM: ": "BPM: ", "Tap Tempo: ": "Tap Tempo: ", "Авто-BPM: определён темп ": "Auto-BPM: tempo detected ", "В meta.json: ": "In meta.json: ", "Выбрана дорожка ноты: ": "Note lane selected: ", "Выделенные ноты (": "Selected notes (", "Выделено рамкой: ": "Box-selected: ", "Выделено: ": "Selected: ", "Выделены все элементы: ": "All items selected: ", "Готово! Скачан архив ": "Done! Downloaded archive ", "Диагонали: ": "Diagonals: ", "Длина: ": "Length: ", "Добавлен эффект ": "Effect ", "Добавлена серия из ": "Added a series of ", "Загружен видео-фон ": "Video background ", "Загружен фон ": "Background ", "Загружена демо-карта «": "Demo map «", "Загружена карта \"": "Loaded map \"", "Загружена карта «": "Loaded map «", "Загружена обложка ": "Cover ", "Загружено аудио ": "Audio ", "Загружено видео ": "Video ", "Карта подписана скрытой меткой SwipEdit (": "The map is signed with a hidden SwipEdit mark (", "Нота ": "Note ", "Официальная карта «": "Official map «", "Ошибка конвертации .ctex: ": "Conversion error .ctex: ", "Ошибка конвертации .oggvorbisstr: ": "Conversion error .oggvorbisstr: ", "Ошибка сборки .swmap: ": "Error building .swmap: ", "Ошибка чтения .swmap: ": "Error reading .swmap: ", "Ошибка чтения .swmap:\\n": "Error reading .swmap:\\n", "По всему треку (": "Whole track (", "Подключено превью-видео ": "Preview video ", "Поставлен кастомный NOTE_SPEED = ": "Custom NOTE_SPEED = ", "Поставлено событие NOTE_SPEED = ": "NOTE_SPEED = ", "Проверка карты: найдено ": "Map check: ", "Распаковка ": "Unpacking ", "Режим таймлайна: ": "Timeline mode: ", "Сдвинуто: ": "Shifted: ", "Сконвертирован Godot ": "Godot ", "Скопировано вперёд (+": "Copied forward (+", "Скорость проигрывания превью: ": "Preview playback speed: ", "Сложность в meta.json установлена по расчёту плотности: ": "Difficulty in meta.json set from density calculation: ", "Событие ": "Event ", "ТАКТ (": "BAR (", "ТАКТЫ (": "BARS (", "Тактовый размер метронома и сетки: ": "Metronome and grid time signature: ", "Убрана нота ": "Note ", "Удалено выделенных элементов: ": "Selected items deleted: ", "ℹ Последний NOTE_SPEED равен ": "ℹ Last NOTE_SPEED is ", "ℹ У ноты ": "ℹ Note ", "⚠ Дубликат одинаковой ноты ": "⚠ Duplicate of the same note ", "⚠ Нота ": "⚠ Note ", "⚠ Событие NOTES_FLOW_RIGHT на ": "⚠ NOTES_FLOW_RIGHT event at ", "✅ Проблем не найдено! Нот: ": "✅ No problems found! Notes: ", "🎹 Ноты и Инспектор": "🎹 Notes & Inspector", "✨ Эффекты и События": "✨ Effects & Events", "📊 Аналитика и SDP": "📊 Analytics & SDP", "⚙ Карта и Файлы": "⚙ Map & Files", "📱 Режим вкладок": "📱 Tabbed Mode", "🖥 Режим плиток (ПК)": "🖥 Tile Mode (PC)", "🟢 SwipEdit": "🟢 SwipEdit", "🔴 Создано в Swipetava Maker (Друнов)": "🔴 Made in Swipetava Maker (Drunov)", "🔴 Сторонний редактор": "🔴 Third-party Editor", "Ничего не выбрано. Кликни по ноте или ивенту на таймлайне.": "Nothing selected. Click a note or event on the timeline.", "🆕 Новая карта": "🆕 New Map", "Создать новую пустую карту (с предупреждением о несохранённых изменениях)": "Create a new blank chart (with unsaved changes warning)", "По умолчанию (фон игры)": "Default (in-game background)", "Оставь пустым, чтобы использовать дефолтный/пользовательский фон самой игры, или укажи bg.png / bg.ogv": "Leave empty to use the game's default/custom background, or specify bg.png / bg.ogv", "🎨 Градиент": "🎨 Gradient", "Сгенерировать градиентный фон 1280×720 под цвет меню карты и вшить как bg.png": "Generate a 1280×720 gradient background matching the menu color and pack as bg.png", "Убрать фон из карты (в игре останется стандартный или кастомный фон игрока)": "Remove map background (the game will keep its default or player custom background)", "Создана новая пустая карта": "Created a new blank chart", "Открыта пустая карта. Загрузи аудио или начни ставить ноты на таймлайне.": "Opened a blank chart. Load audio or start placing notes on the timeline.", "Фон сброшен: в игре будет использоваться стандартный или кастомный фон игрока": "Background cleared: the game will use its default or player custom background", "Сгенерирован градиентный фон bg.png (1280×720) под цвет меню": "Generated gradient background bg.png (1280×720) matching menu color", "bg.png (Градиент 1280×720)": "bg.png (Gradient 1280×720)", "📐 Формула объективной сложности SDP v2.0 (SwipEdit's Difficulty Points)": "📐 Objective Difficulty Formula SDP v2.0 (SwipEdit's Difficulty Points)", "Честные звёзды": "True difficulty", "честные звёзды (Auto ★)": "true difficulty (Auto ★)", "расчёт Честных звёзд (Auto ★)": "True Difficulty calculation (Auto ★)", "5. Зависимость множителя длины от среднего NPS (L_mod) и расчёт Честных звёзд (Auto ★):": "5. Length multiplier from average NPS (L_mod) & True Difficulty (Auto ★):", "1. Временное расстояние между нотами (Δt_mean, Δt_p25) и плотность:": "1. Note time spacing (Δt_mean, Δt_p25) and density:", "2. Паттерны, углы, джеки, стаки, реверсы и наслоение (w_i):": "2. Patterns, angles, jacks, stacks, reverses and overlap (w_i):", "3. Скорость скролла, турбулентность скорости и мгновенный стрейн (M_scroll, strain_i):": "3. Scroll speed, speed turbulence and instant strain (M_scroll, strain_i):", "4. Нагруженность по эффектам (FX_load) по тяжести для восприятия:": "4. Visual effect load (FX_load) weighted by perceptual intensity:", "Учитывается не только средний NPS по карте, но и реальная дистанция": "Accounts not only for average map NPS, but also the actual time gap", "между соседними нотами и плотность быстрых сплитов/стримов (25-й перцентиль": "between adjacent notes and the density of fast splits/streams (25th percentile", "— вертикальный стак (": "— vertical stack (", "— диагональ;": "— diagonal;", "— быстрый повтор одного направления подряд (": "— fast consecutive repeat of the same direction (", "при": "at", "Δt < 0.32 с": "Δt < 0.32 s", "— резкие смены угла": "— sharp angle turns", "и серии зигзагов из 3+ нот;": "and zigzag chains of 3+ notes;", "— визуальное сближение соседних нот на дорожке (": "— visual overlap of adjacent notes on the lane (", "Высокая скорость пролёта (": "High scroll speed (", ", когда на чтение ноты остаётся": ", leaving only", "200–500 мс": "200–500 ms", ") и частые рывки": "to read a note) and frequent", ") кратно повышают нагрузку на реакцию.": "changes multiply reaction strain.", "Тяжёлые (вес 2.1–4.5):": "Heavy (weight 2.1–4.5):", "Средние (вес 1.0–1.9):": "Medium (weight 1.0–1.9):", "Лёгкие (вес 0.10–0.65):": "Light (weight 0.10–0.65):", "Чем выше средний": "The higher the average", "и скорость скролла, тем быстрее карта выходит на полный множитель длины": "and scroll speed, the faster the chart reaches full length multiplier", "(интенсивный 50-секундный уровень не занижается из-за хронометража).": "(an intense 50-second chart is not underrated due to duration).", "вычисляются напрямую из физики чарта: интервалов между нотами, скорости и дёрганий скролла, геометрии паттернов и тяжести визуальных эффектов — без потолка и без привязки к конкретным картам.": "are calculated directly from chart physics: note intervals, scroll speed and surges, pattern geometry and visual effect load — with no cap and no hardcoded map anchors.", "вычисляются напрямую из физики чарта: интервалов между нотами, скорости и дёрганий скролла, геометрии паттернов и тяжести визуальных эффектов — без потолка и без привязки к конкретным картам. Это позволяет объективнее оценивать сложность у множества различных карт.": "are calculated directly from chart physics: note intervals, scroll speed and surges, pattern geometry and visual effect load — with no cap and no hardcoded map anchors. This provides an accurate difficulty rating across all kinds of charts.", "Объективная сложность SDP v2.0 и Честные звёзды": "Objective SDP v2.0 & True Difficulty", "Создать новую пустую карту": "Create a new blank chart", "Загрузить демо-карту (Tutorial — Arvicheskyy)": "Load the demo chart (Tutorial — Arvicheskyy)", "Загрузить фоновую картинку (.png/.jpg/.webp) или готовый видео-фон .ogv напрямую в архив .swmap": "Load a background image (.png/.jpg/.webp) or a ready .ogv video background directly into the .swmap archive", "Авто-синхронизация REVERSE → NOTES_FLOW_RIGHT и REVERSE_BACK → NOTES_FLOW_LEFT (с защитой 1-й секунды)": "Auto-sync REVERSE → NOTES_FLOW_RIGHT and REVERSE_BACK → NOTES_FLOW_LEFT (with 1st-second protection)", "🔄 Авто-синк": "🔄 Auto-sync", "Официальная демо-карта Tutorial (v1.1) из саундтрека Swipetava.": "Official Tutorial demo chart (v1.1) from the Swipetava soundtrack.", "📱 Горизонтальный GUI": "📱 Landscape GUI", "Включить горизонтальный мобильный интерфейс (Landscape DAW с боковым рейлом и плавающим превью)": "Switch to Landscape mobile GUI (Landscape DAW with side rail and floating preview)", "🎬 Превью карты": "🎬 Map Preview", "⤢ Развернуть": "⤢ Expand", "⤡ Свернуть": "⤡ Compact", "Развернуть / свернуть микшер, транспорт и инспектор внутри окна превью": "Expand / collapse mixer, transport and inspector inside the preview window", "Скрыть окно превью (открывается кнопкой 🎬 Превью)": "Hide preview window (reopen via 🎬 Preview button)", "Открыть / скрыть окно живого превью карты": "Open / hide live map preview window", "Пуск / Пауза (Space)": "Play / Pause (Space)", "В начало": "Stop / To start", "🆕 Новая": "🆕 New", "📂 Открыть": "📂 Open", "⛶ Полный экран": "⛶ Fullscreen", "🖥 Классич. вид": "🖥 Classic View", "Полный экран + Горизонтальный разворот (Fullscreen API / 90°)": "Fullscreen + Landscape rotation (Fullscreen API / 90°)", "Вернуться в классический вид редактора": "Return to classic editor view", "Карандаш / Правка нот": "Pencil / Edit notes", "Выделение рамкой и перетаскивание группы": "Box selection & group drag", "Прокрутка и зум таймлайна": "Scroll & zoom timeline", "Ластик": "Eraser", "Правка": "Edit", "Рамка": "Select", "Скролл": "Scroll", "Превью": "Preview", "Ивенты": "Events", "Карта": "Map", "Открыть панель Событий, Шейдеров и NOTE_SPEED": "Open Events, Shaders & NOTE_SPEED drawer", "Открыть параметры карты, Аудио, Фон и Плейлисты": "Open Map settings, Audio, Background & Playlists drawer", "Открыть статистику NPS и SDP v2.0": "Open NPS & SDP v2.0 analytics drawer", "🌙 Тема": "🌙 Theme", "☀️ Тема": "☀️ Theme", "🌙 Тёмная": "🌙 Dark", "☀️ Светлая": "☀️ Light", "Переключить тему (Тёмная / Светлая, авто по системе)": "Toggle theme (Dark / Light, auto from device)", "Переключить тему (Тёмная / Светлая)": "Toggle theme (Dark / Light)"};
+  const I18N_DICT_EN = {
+  "Музыка:": "Music:",
+  "Хитсаунд:": "Hitsound:",
+  "Метроном:": "Metronome:",
+  "🥁 Tap BPM (T)": "🥁 Tap BPM (T)",
+  "Нажимай в ритм мышью или клавишей T для определения BPM": "Tap in rhythm with mouse or T key to detect BPM",
+  "🎯 В курсор": "🎯 To cursor",
+  "Поставить сдвиг сетки (первую точку темпа) ровно на текущую позицию курсора": "Set gridOffset (first timing point) to current cursor position","📈 Кривая плотности чарта (клик — переход к моменту)": "📈 Chart density curve (click to jump)", "Плавная кривая NPS": "Smooth NPS curve", "Поставь ноты на карту, чтобы увидеть плавную кривую NPS": "Place notes on the chart to see the smooth NPS curve", "Перетащи окно за шапку": "Drag window by header", "(6) и": "(6) and", "(7) с чартами, обложками и автоподгрузкой песен:": "(7) with charts, covers and automatic song loading:", "(meta.json + chart.json + ассеты)": "(meta.json + chart.json + assets)", "(которое в игре ограничено": "(which is limited in the game to", "(перетащи любую выделенную ноту, чтобы сдвинуть всю группу)": "(drag any selected note to move the whole group)", "(с защитой 1-й секунды)": "(with 1st-second protection)", ") получают прогрессивный бонус выносливости.": ") earn a progressive endurance bonus.", "), все 24 карты и треки из 3 официальных плейлистов (": "), all 24 maps and tracks from the 3 official playlists (", "): тап по строке нужного направления ставит ноту, а тап по другой строке в том же столбце собирает": "): tap a lane to place a note, and tap another lane in the same column to build", "+ Точка на курсоре": "+ Point at cursor", "+10мс": "+10ms", "+10мс ⏩": "+10ms ⏩", "+1мс": "+1ms", "+1мс ▶": "+1ms ▶", ", а длинные выматывающие треки (>95 с и >240 нот, как": ", while long grueling tracks (>95 s and >240 notes, as", "-10мс": "-10ms", "-1мс": "-1ms", "00:00.000 (0.000s) | Такт 1.1": "00:00.000 (0.000s) | Bar 1.1", "1 доля (в бит)": "1 beat (on the beat)", "1 столбик = 1 секунда": "1 bar = 1 second", "1 такт (4 доли)": "1 bar (4 beats)", "Параметры карты и ресурсы": "Map parameters and assets", "1. Плотность и активный отрезок (Active Span):": "1. Density and active span (Active Span):", "1.0x (Сброс)": "1.0x (Reset)", "1/1 доли": "1/1 beats", "1/16 доли": "1/16 beat", "1/2 доли": "1/2 beats", "1/2 доли (быстро)": "1/2 beats (fast)", "1/4 доли": "1/4 beats", "1/8 доли": "1/8 beats", "10-рядном Пиано-ролле": "10-lane Piano Roll", "1000 мс": "1000 ms", "2 доли": "2 beats", "2. Вес каждого таймкода (w_i) — стаки, диагонали, углы и реверсы:": "2. Weight of each timecode (w_i) — stacks, diagonals, angles and reverses:", "3. Ноты, скорость, эффекты и надписи": "3. Notes, Speed, Effects & Texts", "3. Скорость чтения (M_speed) и мгновенный стрейн (strain_i):": "3. Reading speed (M_speed) and instant strain (strain_i):", "4. Множитель длины и выносливости марафона (L_mod и E_pts):": "4. Length and marathon endurance multiplier (L_mod and E_pts):", "Плотность чарта (NPS) и объективная сложность в баллах (без лимита)": "Chart Density (NPS) & Objective Difficulty Points (Uncapped)", "5. Итоговый балл SDP и перевод в честные звёзды (Auto ★):": "5. Final SDP score and conversion to true difficulty (Auto ★):", "8 направлений нот ·": "8 note directions ·", "95-й перцентиль: 0.0 н/с": "95th percentile: 0.0 n/s", "Auto ★ = round_0.5(SDP / 65)   (1★ ≈ 65 SDP; 1–5★ белые, 5.5–10★ красные поверх, >10★ невозможная карта)": "Auto ★ = round_0.5(SDP / 65)   (1★ ≈ 65 SDP; 1–5★ white, 5.5–10★ red, >10★ Impossible)", "BPM: 120 ·Множитель чтения: 1.00x": "BPM: 120 · Reading multiplier: 1.00x", "HTML5 Canvas 2D, Web Audio API, встроенный упаковщик ZIP/Deflate (": "HTML5 Canvas 2D, Web Audio API, built-in ZIP/Deflate packer (", "SwipEdit— Редактор карт (.swmap)": "SwipEdit — Map Editor (.swmap)", "WASD / Стрелки / Q E Z C": "WASD / Arrows / Q E Z C", "sdp это что? (what?)": "what is sdp? (what?)", "Δt_i < 0.35 с": "Δt_i < 0.35 s", "Авто-выключение через (с):": "Auto-off after (s):", "Авто-генерация 1280×720": "Auto-generate 1280×720", "Авто-генерация 512×512": "Auto-generate 512×512", "Авто-синхронизация": "Auto-sync", "Автоматически прятать комбо (": "Automatically hide combo (", "Автономный веб-редактор карт": "Standalone web map editor", "Артист (artist)": "Artist (artist)", "Ассеты архива .swmap": ".swmap archive assets", "Аудио:": "Audio:", "Базовая скорость скролла и BPM (chart.json)": "Base scroll speed and BPM (chart.json)", "Базовый BPM": "Base BPM", "Баллы сложности (SDP)": "Difficulty points (SDP)", "Без верхнего лимита": "No upper limit", "Быстрые кнопки шейдеров FX_*": "Quick shader buttons FX_*", "Быстрый штамп эффекта на курсор:": "Quick effect stamp at cursor:", "В meta.json: 0.5 ★": "In meta.json: 0.5 ★", "В отличие от ручного поля": "Unlike the manual field", "ВКЛАДКА НОТ И ИНСПЕКТОРА (ДЛЯ ТАБОВОГО РЕЖИМА И МОБИЛОК)": "NOTES & INSPECTOR TAB (FOR TAB MODE AND MOBILE)", "Время": "Time", "Время (с)": "Time (s)", "Все 3 плейлиста из игры:": "All 3 playlists from the game:", "Все события": "All events", "Встроенная библиотека всех 3 официальных плейлистов (24 карты с обложками и песнями)": "Built-in library of all 3 official playlists (24 maps with covers and songs)", "Выделено: 0": "Selected: 0", "Генератор надписей по долям": "Text generator by beats", "Горячие клавиши:": "Hotkeys:", "Готов к работе.": "Ready.", "Двойной клик по дорожке — поставить ноту/эффект · Перетаскивание мышью — сдвиг времени · ПКМ / Delete — удалить · Колесо — прокрутка (Ctrl+колесо — зум)": "Double-click a lane — place note/effect · Drag — shift time · RMB / Delete — remove · Wheel — scroll (Ctrl+wheel — zoom)", "Диагонали: 0% · Смены ≥90°: 0": "Diagonals: 0% · Turns ≥90°: 0", "Динамическая скорость скролла (NOTE_SPEED)": "Dynamic scroll speed (NOTE_SPEED)", "Длительность (с)": "Duration (s)", "Добавить событие / шейдер / надпись": "Add event / shader / text", "Дорожка и камера": "Lane & camera", "Загрузка расчёта текущей карты...": "Calculating current map...", "Идея, сборка и адаптация:": "Idea, build and adaptation:", "Инспектор выбранного элемента": "Selected Item Inspector", "Инспектор выбранной ноты или ивента": "Selected note or event inspector", "Исходный код": "Source code", "Карточка трека (meta.json)": "Track card (meta.json)", "Кликни по ноте или событию на таймлайне для тонкой правки (ПКМ или Delete — удалить).": "Click a note or event on the timeline for fine editing (RMB or Delete — remove).", "Короткие спам-карты (<30 с) штрафуются множителем": "Short spam maps (<30 s) are penalized by a multiplier", "Кто делал": "Who made it", "Масштаб:": "Zoom:", "Микро-сдвиг ноты:": "Micro-shift note:", "Микшер громкости: BGM, Хитсаунды, Метроном": "Volume mixer: BGM, Hitsounds, Metronome", "Микшер звука ниже ↓": "Audio mixer below ↓", "Множитель speed": "Speed multiplier", "НИЖНИЙ ДОК ТАЙМЛАЙНА": "TIMELINE BOTTOM DOCK", "На телефоне удобнее всего ставить ноты прямо на": "On a phone it's easiest to place notes directly on", "Название (title)": "Title (title)", "Не загружено (синтезатор)": "Not loaded (synth)", "Нот:": "Notes:", "Ноты, скорость, эффекты и надписи": "Notes, speed, effects and text", "Обложка:": "Cover:", "Оригинальная игра": "Original game", "Отмена": "Cancel", "Очистить ноты": "Clear notes", "ПАНЕЛЬ АНАЛИТИКИ ПЛОТНОСТИ ЧАРТА (NPS) И БЕЗЛИМИТНОЙ СЛОЖНОСТИ В БАЛЛАХ": "CHART DENSITY (NPS) AND NO-LIMIT DIFFICULTY ANALYTICS PANEL", "ПРАВАЯ КОЛОНКА: НОТЫ, ЭФФЕКТЫ, СКОРОСТЬ СКРОЛЛА И НАДПИСИ ВМЕСТО КОМБО": "RIGHT COLUMN: NOTES, EFFECTS, SCROLL SPEED AND TEXT INSTEAD OF COMBO", "Палитра нот (8 свайпов + реверс)": "Note palette (8 swipes + reverse)", "Панель вкладок (основная навигация на телефонах + переключатель Вкладки / Плитки для ПК)": "Tab bar (main navigation on phones + Tabs / Tiles switch for PC)", "Параметры": "Settings", "Пик 1с:": "Peak 1s:", "Пиковый NPS (Макс 1с / 3с)": "Peak NPS (Max 1s / 3s)", "Плейлист": "Playlist", "Плотность чарта (NPS) и объективная сложность в баллах (SDP)": "Chart density (NPS) and objective difficulty in points (SDP)", "По всему треку: 0.00 н/с": "Whole track: 0.00 n/s", "Подлёт ноты (мс)": "Note approach (ms)", "Попап с объяснением формулы SDP для демон-листа / невозможных уровней": "Popup explaining the SDP formula for the demon list / impossible levels", "Поставить на курсор": "Place at cursor", "Превью карты": "Map preview", "Привязка:": "Snap:", "Пуск/Пауза ·": "Play/Pause ·", "Разбивает строку по словам или через": "Splits the line by words or using", "Размер:": "Time Sig:", "Распространяется под лицензией": "Distributed under license", "Реверс-ноты ·": "Reverse notes ·", "Свободно": "Free", "Свой множитель NOTE_SPEED:": "Custom NOTE_SPEED multiplier:", "Свой…": "Custom…", "Своя…": "Custom…", "Сдвиг сетки (gridOffset, с)": "Grid offset (gridOffset, s)", "Скорость:": "Speed:", "Скролл и Темп": "Scroll & Tempo", "Сложность (0.5–10 ★)": "Difficulty (0.5–10 ★)", "Сложность:": "Difficulty:", "Событий:": "Events:", "Список событий на карте": "Map event list", "Ср. NPS:": "Avg NPS:", "Средний NPS (активный)": "Average NPS (active)", "Ставить кликом": "Place on click", "Стаки и Реверсы": "Stacks & Reverses", "Тайминг и базовая скорость скролла": "Timing and base scroll speed", "Таймлайн": "Timeline", "Текст надписи": "Text content", "Тип": "Type", "Тип ивента": "Event type", "Только NOTE_SPEED": "NOTE_SPEED only", "Только TEXT": "TEXT only", "Только шейдеры FX_*": "FX_* shaders only", "Точки смены BPM (timing[])": "BPM change points (timing[])", "Точки темпа (timing[])": "Tempo points (timing[])", "Транспорт-панель": "Transport panel", "Трек / Карта": "Track / Map", "Файлы внутри .swmap": "Files inside .swmap", "Фон (картинка /": "Background (image /", "Цвет меню (hex)": "Menu color (hex)", "Цвет надписи": "Text color", "Честные звёзды (Auto ★)": "True difficulty (Auto ★)", "Что было использовано": "What was used", "Шаг между словами": "Gap between words", "Шаг по сетке ·": "Grid step ·", "в": "in", "вертикальный стак": "vertical stack", "видео):": "video):", "вместо комбо-счётчика строго в бит начиная с курсора:": "instead of the combo counter, strictly on the beat starting at the cursor:", "внизу (режим": "at the bottom (mode", "вычисляется напрямую из геометрии и таймингов чарта и": "is calculated directly from the chart's geometry and timings and", "генератор надписей": "text generator", "задаёт базовую скорость подлёта (1000 мс по умолчанию), а динамические ускорения/замедления внутри трека ставятся событием": "sets the base approach speed (1000 ms by default), while dynamic speed-ups/slow-downs within the track are set by the event", "значок лицензии": "license badge", "и": "and", "и выставляется автором вручную), оценка": "and set manually by the author), rating", "и выставляется автором вручную), рейтинг": "and set manually by the author), rating", "и расставляет серию ивентов": "and places a series of events", "кредиты кредитная карта": "credits, credit card", "левая колонка": "left column", "не имеет верхнего потолка": "has no upper cap", "палитра нот": "note palette", "панель с аналитикой": "analytics panel", "перед фразой и": "before the phrase and", "после, как в Hi-Tech)": "after, as in Hi-Tech)", "рабочая область": "workspace", "редактор событий": "event editor", "смена скорости прокрутки (с кастомным значением)": "scroll speed change (with custom value)", "смещение": "offset", "события на карте": "events on the map", "центр": "center", "шапка": "header", "— наличие диагонального свайпа (": "— presence of a diagonal swipe (", "— нота": "— note", "— резкий разворот направления между соседними нотами при интервале": "— sharp direction reversal between adjacent notes at an interval of", "— специально для ранжирования челленджей и листа невозможных уровней.": "— specifically for ranking challenges and the impossible levels list.", "— число нот в вертикальном стаке на одном таймкоде (": "— number of notes in a vertical stack on one timecode (", "— это позволяет объективнее оценивать сложность у множества карт.": "— this allows a more objective difficulty rating for many maps.", "↶ Отмена": "↶ Undo", "↷ Повтор": "↷ Redo", "⇄ Зеркало Г": "⇄ Mirror H", "⇅ Зеркало В": "⇅ Mirror V", "≤ 5 мс": "≤ 5 ms", "⏪ -10мс": "⏪ -10ms", "⏱ Метроном:": "⏱ Metronome:", "⏹ Стоп": "⏹ Stop", "▶ Пуск": "▶ Play", "◀ -1мс": "◀ -1ms", "★ Записать расчётные звёзды в meta.json": "★ Apply true difficulty to meta.json", "☑ Все": "☑ All", "⚡ Авто BPM": "⚡ Auto BPM", "⚡ Пик волны (Onset)": "⚡ Waveform peak (Onset)", "⚡ Поставить событие на курсор": "⚡ Place event at cursor", "✎ Правка": "✎ Edit", "✕ Сброс": "✕ Clear", "✨ Демо": "✨ Demo", "✨ События и FX": "✨ Events & FX", "❓ Как считается SDP (Формула)": "❓ How SDP is calculated (Formula)", "⧉ Дублировать": "⧉ Duplicate", "⬚ Выделение (Рамка/Группа)": "⬚ Select (Box/Group)", "🌌 Фон / .ogv": "🌌 BG / .ogv", "🎓 Обучающие паузы из туториала (": "🎓 Tutorial training pauses (", "🎬 Видео-фон в превью": "🎬 Video BG in Preview", "🎬 Превью": "🎬 Preview", "🎵 Загрузить": "🎵 Load", "🎵 Информация": "🎵 Info", "🎵 Музыка:": "🎵 Music:", "🎵 Официальный саундтрек (24 карты)": "🎵 Official soundtrack (24 maps)", "🎹 Набивка нот, стаки и микро-тайминг": "🎹 Note filling, stacks & micro-timing", "🎹 Пиано-ролл (10 рядов)": "🎹 Piano Roll (10 lanes)", "🎹 Смещение": "🎹 Offset", "👁 Превью-видео": "👁 Preview Video", "💬 Разложить фразу по битам": "💬 Split phrase by beats", "💾 Скачать .swmap": "💾 Download .swmap", "📂 Открыть .swmap": "📂 Open .swmap", "📂 Открыть в редакторе": "📂 Open in editor", "📈 График плотности нот по секундам (клик по пику — переход к дропу)": "📈 Note density chart per second (click a peak — jump to the drop)", "📊 Статистика": "📊 Stats", "📏 Компактно (1 ряд)": "📏 Compact (1 lane)", "📐 Формула объективной сложности SDP (SwipEdit Difficulty Points)": "📐 Objective difficulty formula SDP (SwipEdit Difficulty Points)", "📐 Формула объективной сложности SDP (SwipEdit's Difficulty Points)": "📐 Objective difficulty formula SDP (SwipEdit's Difficulty Points)", "📚 Режим стака": "📚 Stack mode", "📥 Скачать .swmap": "📥 Download .swmap", "🔍 Проверить карту": "🔍 Check map", "🔴 Запись": "🔴 Record", "🖐 Прокрутка / Зум": "🖐 Scroll / Zoom", "🖥 Режим: Плитки / Вкладки": "🖥 Mode: Tiles / Tabs", "🖼 Обложка": "🖼 Cover", "🗑 Удалить": "🗑 Delete", "🗑 Удалить выбранное": "🗑 Delete selected", "🥁 Хитсаунд:": "🥁 Hitsound:", "🧲 Сетка + Пик": "🧲 Grid + Peak", "🧹 Ластик": "🧹 Eraser", "Автоматически определить BPM и сдвиг сетки (gridOffset) по загруженному аудио": "Automatically detect BPM and grid offset (gridOffset) from the loaded audio", "Базовое время прилёта ноты от края к центру в миллисекундах (меньше = быстрее базовый скролл)": "Base note travel time from edge to center in milliseconds (lower = faster base scroll)", "Вид дорожки нот: 10-рядный Пиано-ролл (удобно для телефонов и стаков) или Компактно (1 ряд)": "Lane view: 10-lane Piano Roll (handy for phones and stacks) or Compact (1 lane)", "Включает обучающие паузы из 1.1 (tutorial_controller.gd) на первой обычной и первой реверс-ноте карты": "Enables tutorial pauses from 1.1 (tutorial_controller.gd) on the map's first normal and first reverse note", "Включить и настроить громкость метронома по сетке BPM (до 200% усиления)": "Enable and set metronome volume on the BPM grid (up to 200% boost)", "Включить и настроить громкость хитсаундов нот (до 200% усиления)": "Enable and set note hitsound volume (up to 200% boost)", "Выделить все ноты и события карты (Ctrl+A)": "Select all notes and events on the map (Ctrl+A)", "Громкость музыки (BGM)": "Music volume (BGM)", "Дублировать выделенные ноты/ивенты вперёд на 1 долю (Ctrl+D)": "Duplicate selected notes/events forward by 1 beat (Ctrl+D)", "Загрузить демо-карту из 1.1 (Tutorial — Arvicheskyy)": "Load the demo map from 1.1 (Tutorial — Arvicheskyy)", "Загрузить фоновую картинку (.png/.jpg/.webp) или готовый видео-фон .ogv напрямую в архив .swmap без перекодирования": "Load a background image (.png/.jpg/.webp) or a ready video background .ogv directly into the .swmap archive without re-encoding", "Закрыть": "Close", "Записать расчётные звёзды сложности в поле difficulty (meta.json, макс. 10★)": "Write accurate difficulty stars to the difficulty field (meta.json, max 10★)", "Знаменатель: длительность одной доли (4 = четверть, 8 = восьмая)": "Denominator: length of one beat (4 = quarter, 8 = eighth)", "Имя аудиофайла в chart.json": "Audio file name in chart.json", "Имя файла обложки в chart.json": "Cover file name in chart.json", "Имя фонового файла в chart.json (например bg.png или bg.ogv)": "Background file name in chart.json (e.g. bg.png or bg.ogv)", "Кастомная скорость воспроизведения (0.10x – 4.00x)": "Custom playback speed (0.10x – 4.00x)", "Надпись": "Text", "Нажимай в ритм для определения BPM": "Tap in rhythm to detect BPM", "Наслаивать ноты разных направлений в один вертикальный стак на одном таймкоде": "Stack notes of different directions into one vertical stack on the same timecode", "Объективная сложность чарта в баллах (без лимита)": "Objective chart difficulty in points (no limit)", "Опционально: если мобильный браузер не декодирует Ogg Theora (.ogv) в превью, подставь любой .mp4/.webm чисто для предпросмотра (в .swmap уйдёт твой .ogv)": "Optional: if the mobile browser can't decode Ogg Theora (.ogv) in the preview, use any .mp4/.webm just for preview (your .ogv will still go into the .swmap)", "Отзеркалить все ноты по вертикали": "Mirror all notes vertically", "Отзеркалить все ноты по горизонтали": "Mirror all notes horizontally", "Отзеркалить выделенные ноты по вертикали": "Mirror selected notes vertically", "Отзеркалить выделенные ноты по горизонтали": "Mirror selected notes horizontally", "Открыть подробный разбор математической формулы SDP и расчёт по текущей карте": "Open a detailed breakdown of the SDP math formula and the calculation for the current map", "Открыть существующий .swmap или перетащить файл на страницу": "Open an existing .swmap or drag the file onto the page", "Отменить (Ctrl+Z)": "Undo (Ctrl+Z)", "Переключить раскладку: Вкладки (мобильная) / Плитки (ПК)": "Switch layout: Tabs (mobile) / Tiles (PC)", "Повторить (Ctrl+Y)": "Redo (Ctrl+Y)", "Подпись SwipEdit проверена: карта создана в SwipEdit": "SwipEdit signature verified: map was created in SwipEdit", "Показывать видео-фон (.ogv) на канвасе превью (выключи на слабом смартфоне, если тормозит декодирование видео)": "Show video background (.ogv) on the preview canvas (turn off on a weak phone if video decoding lags)", "Пресет скорости воспроизведения": "Playback speed preset", "Проверить карту на ошибки перед сохранением": "Check the map for errors before saving", "Разделы редактора": "Editor sections", "Регулировка громкости превью": "Preview volume adjustment", "Режим живой записи (свайпы и клавиши ставят ноты на лету под музыку)": "Live recording mode (swipes and keys place notes on the fly to the music)", "Режим касания пальцем / мышью по таймлайну": "Finger / mouse touch mode on the timeline", "Скачать отдельно chart.json и meta.json": "Download chart.json and meta.json separately", "Слова через пробел или |": "Words separated by space or |", "Снять выделение (Esc)": "Deselect (Esc)", "Собрать и скачать готовый архив .swmap для импорта в Swipetava": "Build and download a ready .swmap archive for import into Swipetava", "Сразу собрать и скачать выбранную официальную карту как .swmap": "Immediately build and download the selected official map as .swmap", "Сразу ставить ноту при клике по кнопке направления": "Place a note immediately when clicking a direction button", "Тактовый размер для метронома и тактовой сетки таймлайна (3/4, 4/4, 5/4, 6/8, 11/8 или любой свой N/M)": "Time signature for the metronome and timeline bar grid (3/4, 4/4, 5/4, 6/8, 11/8 or any custom N/M)", "Удалить все выделенные элементы (Delete)": "Delete all selected items (Delete)", "Цвет серии надписей": "Text series color", "Числитель: число долей в такте": "Numerator: beats per bar", "Шаг вперёд по сетке (])": "Step forward on the grid (])", "Шаг назад по сетке ([)": "Step back on the grid ([)", "${fileName} (${(bytes.byteLength / 1024 / 1024).toFixed(2)} МБ)": "${fileName} (${(bytes.byteLength / 1024 / 1024).toFixed(2)} MB)", "${formatTime(state.currentTime)} / ${formatTime(state.duration)} | Такт ${barIdx}.${beatIdx} (${tsNum}/${tsDen})": "${formatTime(state.currentTime)} / ${formatTime(state.duration)} | Bar ${barIdx}.${beatIdx} (${tsNum}/${tsDen})", "${scopeTxt} отзеркалены по вертикали (↑ ↔ ↓)": "${scopeTxt} mirrored vertically (↑ ↔ ↓)", "${scopeTxt} отзеркалены по горизонтали (← ↔ →)": "${scopeTxt} mirrored horizontally (← ↔ →)", "${st.avgNps.toFixed(2)} н/с": "${st.avgNps.toFixed(2)} n/s", "${st.minEffTravelMs} мс (${st.maxSpeed.toFixed(2)}x)": "${st.minEffTravelMs} ms (${st.maxSpeed.toFixed(2)}x)", "${st.stacksCount} (макс ×${st.maxStackSize}) / ${st.reversesCount}": "${st.stacksCount} (max ×${st.maxStackSize}) / ${st.reversesCount}", ", трек загружен!": ", track loaded!", "95-й перцентиль: ${st.p95Nps.toFixed(1)} н/с": "95th percentile: ${st.p95Nps.toFixed(1)} n/s", ": '(мгнов.)'}": ": '(instant)'}", "<button type=\"button\" class=\"pad-btn pad-center\" id=\"btn-place-active-note\" title=\"Поставить выбранную ноту на текущий таймкод\">Поставить</button>": "<button type=\"button\" class=\"pad-btn pad-center\" id=\"btn-place-active-note\" title=\"Place the selected note on the current timecode\">Place</button>", "<div class=\"muted-hint\">Кликни по любой ноте или событию на таймлайне (или в таблице справа), чтобы изменить его точное время, направление, текст, цвет или скорость. Правый клик или клавиша <code>Delete</code> удаляет элемент.</div>": "<div class=\"muted-hint\">Click any note or event on the timeline (or in the table on the right) to change its exact time, direction, text, color or speed. Right-click or the <code>Delete</code> key removes the item.</div>", "<label>Длительность duration (сек)\n            <input type=\"number\" id=\"insp-ev-duration\" step=\"0.05\" min=\"0.05\" value=\"${item.duration !== undefined ? item.duration : (def.defaultDuration || 0.5)}\" />\n          </label>": "<label>Duration (sec)\n            <input type=\"number\" id=\"insp-ev-duration\" step=\"0.05\" min=\"0.05\" value=\"${item.duration !== undefined ? item.duration : (def.defaultDuration || 0.5)}\" />\n          </label>", "<label>Множитель скорости speed\n            <input type=\"number\" id=\"insp-ev-speed\" step=\"0.05\" min=\"0.1\" max=\"10\" value=\"${item.speed !== undefined ? item.speed : 1.5}\" />\n          </label>": "<label>Speed multiplier speed\n            <input type=\"number\" id=\"insp-ev-speed\" step=\"0.05\" min=\"0.1\" max=\"10\" value=\"${item.speed !== undefined ? item.speed : 1.5}\" />\n          </label>", "<label>Надпись (text)\n            <input type=\"text\" id=\"insp-ev-text\" value=\"${escapeHtml(item.text || '')}\" />\n          </label>": "<label>Text (text)\n            <input type=\"text\" id=\"insp-ev-text\" value=\"${escapeHtml(item.text || '')}\" />\n          </label>", "<label>Цвет (color)\n            <input type=\"color\" id=\"insp-ev-color\" value=\"${item.color || def.defaultColor || '#ffffff'}\" />\n          </label>": "<label>Color (color)\n            <input type=\"color\" id=\"insp-ev-color\" value=\"${item.color || def.defaultColor || '#ffffff'}\" />\n          </label>", "<option value=\"${escapeHtml(item.uid)}\" ${isHiTech ? 'selected' : ''}>[${escapeHtml(item.playlistId)}] ${escapeHtml(title)} — ${escapeHtml(artist)} (${bpm} BPM · ${nLen} нот · ${eLen} ив.)</option>": "<option value=\"${escapeHtml(item.uid)}\" ${isHiTech ? 'selected' : ''}>[${escapeHtml(item.playlistId)}] ${escapeHtml(title)} — ${escapeHtml(artist)} (${bpm} BPM · ${nLen} notes · ${eLen} ev.)</option>", "<option value=\"ALL\">Все 3 плейлиста (${allPlaylistSongs.length} карт)</option>": "<option value=\"ALL\">All 3 playlists (${allPlaylistSongs.length} maps)</option>", "BG_COLOR (Смена цвета фона)": "BG_COLOR (Background color change)", "BLACKOUT (Затемнение)": "BLACKOUT (Blackout)", "BPM ${tp.bpm} | SPEED ${st.speed}x (${effMs}мс) | ${st.flowLeft ? '← LEFT' : 'RIGHT →'}": "BPM ${tp.bpm} | SPEED ${st.speed}x (${effMs}ms) | ${st.flowLeft ? '← LEFT' : 'RIGHT →'}", "BPM: ${state.chart.bpm} · Множитель чтения: ${st.speedModAvg.toFixed(2)}x": "BPM: ${state.chart.bpm} · Reading multiplier: ${st.speedModAvg.toFixed(2)}x", "CAMERA_BOB_OFF (Качание камеры ВЫКЛ)": "CAMERA_BOB_OFF (Camera bob OFF)", "CAMERA_BOB_ON (Качание камеры ВКЛ)": "CAMERA_BOB_ON (Camera bob ON)", "DISCO (Неоновая диско-подсветка)": "DISCO (Neon disco lights)", "FLASH (Вспышка мгновенная / долгая)": "FLASH (Flash instant / long)", "FX / КАМЕРА": "FX / CAMERA", "FX_AQUA (Подводный аква-шейдер)": "FX_AQUA (Underwater aqua shader)", "FX_ASH_WIND (Пепельный ветер)": "FX_ASH_WIND (Ash wind)", "FX_BW (Чёрно-белый)": "FX_BW (Black & white)", "FX_DREAD (Тени с краёв / Dread)": "FX_DREAD (Edge shadows / Dread)", "FX_DUOTONE (Дуотон)": "FX_DUOTONE (Duotone)", "FX_ENDING (Кинематографичный финал / интро)": "FX_ENDING (Cinematic ending / intro)", "FX_GLITCH (Глитч полосами)": "FX_GLITCH (Striped glitch)", "FX_HALFTONE (Полутоновый растр)": "FX_HALFTONE (Halftone screen)", "FX_INVERT (Инверсия цветов)": "FX_INVERT (Color invert)", "FX_OLD_TV (Старый ТВ / CRT)": "FX_OLD_TV (Old TV / CRT)", "FX_PIXELATE (Пикселизация)": "FX_PIXELATE (Pixelate)", "FX_POSTERIZE (Постеризация)": "FX_POSTERIZE (Posterize)", "FX_RGB_SPLIT (Хроматический RGB-раскол)": "FX_RGB_SPLIT (Chromatic RGB split)", "FX_WAVE (Волновое искажение)": "FX_WAVE (Wave distortion)", "FX_ZOOM_BLUR (Зум-блюр)": "FX_ZOOM_BLUR (Zoom blur)", "HUD_HIDE (Скрыть комбо / HUD)": "HUD_HIDE (Hide combo / HUD)", "HUD_SHOW (Показать комбо / HUD)": "HUD_SHOW (Show combo / HUD)", "NOTES_BOUNCE_OFF (Прыжки нот ВЫКЛ)": "NOTES_BOUNCE_OFF (Note bounce OFF)", "NOTES_BOUNCE_ON (Прыжки нот ВКЛ)": "NOTES_BOUNCE_ON (Note bounce ON)", "NOTES_FLOW_LEFT (Поток влево ←)": "NOTES_FLOW_LEFT (Flow left ←)", "NOTES_FLOW_RIGHT (Поток вправо →)": "NOTES_FLOW_RIGHT (Flow right →)", "NOTES_SPIN_OFF (Вращение нот ВЫКЛ)": "NOTES_SPIN_OFF (Note spin OFF)", "NOTES_SPIN_ON (Вращение нот ВКЛ)": "NOTES_SPIN_ON (Note spin ON)", "NOTES_WAVE_OFF (Волна нот ВЫКЛ)": "NOTES_WAVE_OFF (Note wave OFF)", "NOTES_WAVE_ON (Волна нот ВКЛ)": "NOTES_WAVE_ON (Note wave ON)", "NOTE_PUSH_OFF (Толчок нот ВЫКЛ)": "NOTE_PUSH_OFF (Note push OFF)", "NOTE_PUSH_ON (Толчок нот ВКЛ)": "NOTE_PUSH_ON (Note push ON)", "NOTE_SPEED (Скорость скролла)": "NOTE_SPEED (Scroll speed)", "SHAKE (Тряска экрана)": "SHAKE (Screen shake)", "TEXT (Надпись вместо комбо)": "TEXT (Text instead of combo)", "Tap Tempo: ${bpm} BPM (${tapTimes.length} нажатий)": "Tap Tempo: ${bpm} BPM (${tapTimes.length} taps)", "Tap Tempo: продолжай нажимать в такт...": "Tap Tempo: keep tapping in time...", "АУДИО ВОЛНА": "AUDIO WAVE", "Авто-BPM: определён темп ${bestBpm} BPM, сдвиг сетки ${offsetSec.toFixed(3)} сек": "Auto-BPM: tempo detected ${bestBpm} BPM, grid offset ${offsetSec.toFixed(3)} sec", "В meta.json: ${state.meta.difficulty} ★ ${renderSwipetavaStarsHtml(state.meta.difficulty)}": "In meta.json: ${state.meta.difficulty} ★ ${renderSwipetavaStarsHtml(state.meta.difficulty)}", "В архиве .swmap не найден обязательный файл chart.json": "Required file chart.json not found in the .swmap archive", "ВОЛНА": "WAVE", "Введи слова через пробел или | для раскидки по битам": "Enter words separated by space or | to spread them across beats", "Видео-фон скрыт в превью (для экономии ресурсов смартфона; в архиве .swmap он сохранится)": "Video background hidden in preview (to save phone resources; it will be kept in the .swmap archive)", "Включены обучающие паузы из туториала (\"tutorial\": \"first_swipe\" на 1-й обычной и 1-й реверс-ноте)": "Tutorial training pauses enabled (\"tutorial\": \"first_swipe\" on the 1st normal and 1st reverse note)", "Возвращает счётчик комбо и интерфейс после серии надписей TEXT (как на карте Hi-Tech)": "Brings back the combo counter and UI after a TEXT series (as on the Hi-Tech map)", "Все ноты": "All notes", "Выбрана дорожка ноты: ${hit.noteType}": "Note lane selected: ${hit.noteType}", "Выводит кастомную надпись в зоне комбо/оценки (как на карте Hi-Tech и в интро)": "Shows a custom text in the combo/rating area (as on the Hi-Tech map and in the intro)", "Выделение (проведи рамкой по нотам или тапай по ним, затем перетащи любую выделенную ноту для сдвига всей группы)": "Selection (draw a box over notes or tap them, then drag any selected note to shift the whole group)", "Выделение снято": "Selection cleared", "Выделенные ноты (${targetNotes.length})": "Selected notes (${targetNotes.length})", "Выделено рамкой: ${state.selectedNotes.size} нот, ${state.selectedEvents.size} событий": "Box-selected: ${state.selectedNotes.size} notes, ${state.selectedEvents.size} events", "Выделено: ${nCnt} нот, ${eCnt} событий": "Selected: ${nCnt} notes, ${eCnt} events", "Выделены все элементы: ${state.selectedNotes.size} нот, ${state.selectedEvents.size} событий": "All items selected: ${state.selectedNotes.size} notes, ${state.selectedEvents.size} events", "Выключает вертикальные прыжки нот": "Turns off vertical note bounce", "Выключает волновое движение нот": "Turns off note wave motion", "Выключает вращение нот": "Turns off note spin", "Выключает импульсный толчок нот": "Turns off note push pulse", "Готово! Скачан архив ${safeName}.swmap (${(zipBytes.byteLength / 1024 / 1024).toFixed(2)} МБ)": "Done! Downloaded archive ${safeName}.swmap (${(zipBytes.byteLength / 1024 / 1024).toFixed(2)} MB)", "Движение нот, реверс дорожки и камера": "Note motion, lane reverse and camera", "Двухцветный контрастный градиент": "Two-tone high-contrast gradient", "Диагонали: ${st.diagPct}% · Смены ≥90°: ${st.sharpTurns}": "Diagonals: ${st.diagPct}% · Turns ≥90°: ${st.sharpTurns}", "Длина: ${st.activeSpan.toFixed(1)}с (множитель длины ×${st.lengthMod.toFixed(2)})": "Length: ${st.activeSpan.toFixed(1)}s (length multiplier ×${st.lengthMod.toFixed(2)})", "Для Авто-BPM сначала загрузи аудиофайл или выбери карту из плейлиста": "For Auto-BPM, first load an audio file or pick a map from a playlist", "Добавлен эффект ${fxType} на ${t.toFixed(3)} сек": "Effect ${fxType} added at ${t.toFixed(3)} sec", "Добавлена серия из ${parts.length} надписей TEXT по битам": "Added a series of ${parts.length} TEXT labels by beats", "Загружен видео-фон ${f.name} → сохранён как ${targetBgName} в .swmap без перекодирования": "Video background ${f.name} loaded → saved as ${targetBgName} in .swmap without re-encoding", "Загружен фон ${f.name}": "Background ${f.name} loaded", "Загружена демо-карта «${state.meta.title}» — ${state.meta.artist} (${state.chart.notes.length} нот, ${state.chart.events.length} событий)": "Demo map «${state.meta.title}» — ${state.meta.artist} loaded (${state.chart.notes.length} notes, ${state.chart.events.length} events)", "Загружена карта \"${state.meta.title}\" — ${state.chart.notes.length} нот, ${state.chart.events.length} событий": "Loaded map \"${state.meta.title}\" — ${state.chart.notes.length} notes, ${state.chart.events.length} events", "Загружена карта «${state.meta.title}» (${entry.playlistId}) — ${state.chart.notes.length} нот, ${state.chart.events.length} событий": "Loaded map «${state.meta.title}» (${entry.playlistId}) — ${state.chart.notes.length} notes, ${state.chart.events.length} events", "Загружена обложка ${f.name}": "Cover ${f.name} loaded", "Загружено аудио ${f.name}": "Audio ${f.name} loaded", "Загружено видео ${f.name} для превью (в самой игре Swipetava поддерживается .ogv)": "Video ${f.name} loaded for preview (the Swipetava game itself supports .ogv)", "Импульсное подёргивание дорожки нот на каждую долю": "Pulsing jerk of the note lane on every beat", "Камера ритмично покачивается и пульсирует в такт BPM": "Camera sways and pulses rhythmically in time with the BPM", "Карта подписана скрытой меткой SwipEdit (${wmTag}) внутри JSON и ZIP.": "The map is signed with a hidden SwipEdit mark (${wmTag}) inside the JSON and ZIP.", "Карта создана в SwipEdit (скрытая подпись активна)": "Map created in SwipEdit (hidden signature active)", "Комиксный точечный растр поверх сцены": "Comic dot-screen overlay on the scene", "Ластик (тап по ноте или событию удаляет его)": "Eraser (tap a note or event to delete it)", "Меняет множитель скорости полёта нот (1 = базовая, 1.25 / 1.5 / 2 = быстрее)": "Changes the note flight speed multiplier (1 = base, 1.25 / 1.5 / 2 = faster)", "Меняет цвет фона карты: при duration = 0 мгновенно, при duration > 0 плавно переливает к выбранному цвету": "Changes the map background color: instantly at duration = 0, smoothly fades to the chosen color at duration > 0", "НОТЫ": "NOTES", "НОТЫ / СТАКИ": "NOTES / STACKS", "Надписи вместо комбо и скорость скролла": "Text instead of combo and scroll speed", "Негатив экрана на время duration": "Screen negative for duration", "Нота ${noteType} поставлена на ${t.toFixed(3)} сек${stackCount > 1 ?": "Note ${noteType} placed at ${t.toFixed(3)} sec${stackCount > 1 ?", "Ноты начинают прыгать вверх-вниз по синусоиде в такт биту": "Notes start bouncing up and down in a sine wave in time with the beat", "Ноты непрерывно вращаются вокруг своей оси во время полёта (из карт SwipeTrava и Ew.mp3)": "Notes spin continuously around their axis during flight (from the SwipeTrava and Ew.mp3 maps)", "Обесцвечивание с повышенным контрастом": "Desaturation with increased contrast", "Обучающие паузы туториала выключены": "Tutorial training pauses disabled", "Останавливает покачивание камеры": "Stops camera sway", "Отменено последнее действие": "Last action undone", "Отрисовка видео-фона (.ogv) в превью включена": "Video background (.ogv) rendering in preview enabled", "Официальная демо-карта Tutorial (v1.1), подписана в SwipEdit.": "Official Tutorial demo map (v1.1), signed in SwipEdit.", "Официальная карта «${state.meta.title}» из встроенной библиотеки SwipEdit.": "Official map «${state.meta.title}» from the built-in SwipEdit library.", "Очистить все ноты на карте?": "Clear all notes on the map?", "Ошибка конвертации .ctex: ${err.message}": "Conversion error .ctex: ${err.message}", "Ошибка конвертации .oggvorbisstr: ${err.message}": "Conversion error .oggvorbisstr: ${err.message}", "Ошибка сборки .swmap: ${err.message}": "Error building .swmap: ${err.message}", "Ошибка чтения .swmap: ${err.message}": "Error reading .swmap: ${err.message}", "Ошибка чтения .swmap:\\n${err.message}": "Error reading .swmap:\\n${err.message}", "По всему треку (${st.totalLength.toFixed(0)}с): ${st.totalNps.toFixed(2)} н/с": "Whole track (${st.totalLength.toFixed(0)}s): ${st.totalNps.toFixed(2)} n/s", "Повторено отменённое действие": "Undone action redone", "Погружает экран в темноту на указанное время (duration)": "Plunges the screen into darkness for the given time (duration)", "Подводное преломление с мягкими аква-волнами и бликами (из карты swtv)": "Underwater refraction with soft aqua waves and glints (from the swtv map)", "Подключено превью-видео ${f.name} (в архиве .swmap остаётся ${state.chart.backgroundFile})": "Preview video ${f.name} connected (the .swmap archive keeps ${state.chart.backgroundFile})", "Поставлен кастомный NOTE_SPEED = ${spd}x на ${t.toFixed(3)} сек": "Custom NOTE_SPEED = ${spd}x placed at ${t.toFixed(3)} sec", "Поставлено событие NOTE_SPEED = ${spd}x на ${t.toFixed(3)} сек": "NOTE_SPEED = ${spd}x event placed at ${t.toFixed(3)} sec", "Поставь ноты на карту, чтобы увидеть график плотности NPS по секундам": "Place notes on the map to see the NPS density chart per second", "Поток летящих нот изгибается плавной синусоидальной волной (из карт SwipeTrava и Ew.mp3)": "The flow of flying notes bends in a smooth sine wave (from the SwipeTrava and Ew.mp3 maps)", "Правка (тап по ряду в Пиано-ролле сразу ставит/убирает ноту или собирает стак)": "Edit (tapping a row in the Piano Roll instantly places/removes a note or builds a stack)", "Проверка карты: всё чисто!": "Map check: all clear!", "Проверка карты: найдено ${issues.length} замечаний": "Map check: ${issues.length} issues found", "Прокрутка (1 палец — двигать дорожку, 2 пальца — зум)": "Scroll (1 finger — move the lane, 2 fingers — zoom)", "Пульсирующие тени с краёв экрана с хроматическим сдвигом и зерном": "Pulsing edge shadows with chromatic shift and grain", "Радиальное размытие и зум к центру": "Radial blur and zoom toward the center", "Распаковка ${file.name}...": "Unpacking ${file.name}...", "Реверс дорожки: линия удара переезжает влево, ноты летят справа налево": "Lane reverse: the hit line moves left, notes fly right to left", "Режим живой записи включён: запусти трек и нажимай кнопки направлений (или клавиши WASD/стрелки) в такт!": "Live recording mode on: start the track and press the direction buttons (or WASD/arrow keys) in time!", "Режим живой записи выключен": "Live recording mode off", "Режим таймлайна: ${titles[state.timelineTouchMode] || state.timelineTouchMode}": "Timeline mode: ${titles[state.timelineTouchMode] || state.timelineTouchMode}", "Резкий ударный шейк камеры": "Sharp impact camera shake", "Резкое квантование палитры цветов": "Harsh color palette quantization", "Ретро-пикселизация изображения на время duration (из карты Hi-Tech)": "Retro image pixelation for duration (from the Hi-Tech map)", "Ритмичное переливание неоновых цветов и прожекторов в такт биту на время duration (из карты Hi-Tech)": "Rhythmic shifting of neon colors and spotlights on the beat for duration (from the Hi-Tech map)", "Сдвинуто: ${notesToMove.length} нот, ${eventsToMove.length} ив. на ${deltaSec > 0 ? '+' : ''}${Math.round(deltaSec * 1000)} мс": "Shifted: ${notesToMove.length} notes, ${eventsToMove.length} ev. by ${deltaSec > 0 ? '+' : ''}${Math.round(deltaSec * 1000)} ms", "Сильное расслоение RGB-каналов экрана на время duration (из карты Tearout)": "Strong RGB channel split of the screen for duration (from the Tearout map)", "Синусоидальное искривление экрана": "Sinusoidal screen warp", "Скачан файл chart.json (со скрытой меткой SwipEdit)": "chart.json downloaded (with hidden SwipEdit mark)", "Сконвертирован Godot ${f.name} (${conv.sourceFormat} ${conv.width}×${conv.height}) → Cover.png": "Godot ${f.name} converted (${conv.sourceFormat} ${conv.width}×${conv.height}) → Cover.png", "Сконвертирован Godot ${f.name} → ${conv.fileName} (${conv.packetsCount} пакетов, ${conv.sampleRate} Гц)": "Godot ${f.name} converted → ${conv.fileName} (${conv.packetsCount} packets, ${conv.sampleRate} Hz)", "Скопировано вперёд (+${span.toFixed(3)}с): ${newNotes.length} нот, ${newEvents.length} ивентов": "Copied forward (+${span.toFixed(3)}s): ${newNotes.length} notes, ${newEvents.length} events", "Скорость проигрывания превью: ${rate}x": "Preview playback speed: ${rate}x", "Скрывает счётчик комбо и интерфейс перед появлением кастомных надписей TEXT (как на карте Hi-Tech)": "Hides the combo counter and UI before custom TEXT labels appear (as on the Hi-Tech map)", "Сложность в meta.json установлена по расчёту плотности: ${rounded} ★ (${st.sdpPoints.toFixed(1)} pts)": "Difficulty in meta.json set from density calculation: ${rounded} ★ (${st.sdpPoints.toFixed(1)} pts)", "Сначала выдели одну или несколько нот/событий для дублирования": "First select one or more notes/events to duplicate", "Событие ${typeId} добавлено на ${t.toFixed(3)} сек": "Event ${typeId} added at ${t.toFixed(3)} sec", "Стак-режим включён: новые ноты на том же таймкоде складываются в вертикальный стак": "Stack mode on: new notes on the same timecode stack vertically", "Стак-режим выключен: нота на том же таймкоде заменяет предыдущую (в Пиано-ролле стаки доступны всегда)": "Stack mode off: a note on the same timecode replaces the previous one (stacks are always available in the Piano Roll)", "Стандартное направление: ноты летят слева направо к линии удара": "Standard direction: notes fly left to right toward the hit line", "Т${barNum} (${t.toFixed(2)}s)": "B${barNum} (${t.toFixed(2)}s)", "ТАКТ (${state.timeSigNum}/${state.timeSigDen})": "BAR (${state.timeSigNum}/${state.timeSigDen})", "ТАКТЫ (${state.timeSigNum}/${state.timeSigDen})": "BARS (${state.timeSigNum}/${state.timeSigDen})", "Тактовый размер метронома и сетки: ${n}/${d}": "Metronome and grid time signature: ${n}/${d}", "Трёхслойный пепел на ветру, горячее марево и тёплый пепельный грейд": "Three-layer ash in the wind, hot haze and warm ash grade", "Убрана нота ${noteType} на ${t.toFixed(3)} сек": "Note ${noteType} removed at ${t.toFixed(3)} sec", "Удалено выделенных элементов: ${delCount}": "Selected items deleted: ${delCount}", "Упаковка .swmap архива...": "Packing .swmap archive...", "Цифровой глитч с разрывом полос и сдвигом сканлайнов": "Digital glitch with striped tearing and scanline shift", "Шейдерные пост-эффекты (FX_*)": "Shader post-effects (FX_*)", "Элемент удалён": "Item deleted", "Эффект интро/концовки с кинематографичными полосами и виньеткой": "Intro/ending effect with cinematic bars and vignette", "Эффект старого телевизора со сканлайнами и помехами": "Old TV effect with scanlines and static", "Яркая вспышка: при duration = 0 — короткая ударная, при duration > 0 — долгая плавная (как на Hi-Tech)": "Bright flash: at duration = 0 — short impact, at duration > 0 — long smooth (as on Hi-Tech)", "мгновенный / триггер": "instant / trigger", "ℹ Последний NOTE_SPEED равен ${speedEvs[speedEvs.length - 1].speed}x (не сброшен обратно в 1.0x до конца карты).": "ℹ Last NOTE_SPEED is ${speedEvs[speedEvs.length - 1].speed}x (not reset back to 1.0x until the end of the map).", "ℹ У ноты ${n.type} на ${n.time.toFixed(3)}с нет явного события ${expected} (игра сама добавит его через _heal_missing_reverse_events).": "ℹ Note ${n.type} at ${n.time.toFixed(3)}s has no explicit ${expected} event (the game will add it itself via _heal_missing_reverse_events).", "⏸ Пауза": "⏸ Pause", "⚠ Внимание: реверс на <= 1.0с сработает в игре сразу со старта (EARLY_EVENT_WINDOW)!": "⚠ Warning: a reverse at <= 1.0s will trigger in the game right from the start (EARLY_EVENT_WINDOW)!", "⚠ Дубликат одинаковой ноты ${notes[i].type} в одном стаке на ${notes[i].time.toFixed(3)}с.": "⚠ Duplicate of the same note ${notes[i].type} in one stack at ${notes[i].time.toFixed(3)}s.", "⚠ Нота ${n.type} на ${n.time.toFixed(3)}с стоит в первой секунде (<= 1.0с): из-за EARLY_EVENT_WINDOW в игре дорожка развернётся сразу на 0.0с.": "⚠ Note ${n.type} at ${n.time.toFixed(3)}s is in the first second (<= 1.0s): because of EARLY_EVENT_WINDOW the lane will reverse right at 0.0s in the game.", "⚠ Реверс на <= 1.0 сек: в игре сработает сразу со старта (EARLY_EVENT_WINDOW)": "⚠ Reverse at <= 1.0 sec: will trigger in the game right from the start (EARLY_EVENT_WINDOW)", "⚠ Событие NOTES_FLOW_RIGHT на ${ev.time.toFixed(3)}с (<= 1.0с) развернёт поток сразу при старте уровня.": "⚠ NOTES_FLOW_RIGHT event at ${ev.time.toFixed(3)}s (<= 1.0s) will reverse the flow right at level start.", "✅ Проблем не найдено! Нот: ${notes.length}, стаков: ${state.lastStats ? state.lastStats.stacksCount : 0}, событий: ${events.length}.": "✅ No problems found! Notes: ${notes.length}, stacks: ${state.lastStats ? state.lastStats.stacksCount : 0}, events: ${events.length}.", "🎬 ${state.chart.backgroundFile} (${sizeMb} МБ, упакован в .swmap; для превью в этом браузере можно выбрать 👁 Превью-видео)": "🎬 ${state.chart.backgroundFile} (${sizeMb} MB, packed in .swmap; for preview in this browser you can choose 👁 Preview video)", "🎬 ${state.chart.backgroundFile} (${v.videoWidth}×${v.videoHeight}, ${sizeMb} МБ)": "🎬 ${state.chart.backgroundFile} (${v.videoWidth}×${v.videoHeight}, ${sizeMb} MB)", "🎬 ${state.chart.backgroundFile} + превью ${fileName} (${v.videoWidth}×${v.videoHeight})": "🎬 ${state.chart.backgroundFile} + preview ${fileName} (${v.videoWidth}×${v.videoHeight})", "📐 Вид: Вкладки (Мобильный)": "📐 View: Tabs (Mobile)", "🔴 Другой редактор": "🔴 Other editor", "🔴 ЗАПИСЬ ВКЛ": "🔴 RECORDING ON", "🖥 Вид: Плитки (ПК)": "🖥 View: Tiles (PC)", "🟢 SwipEdit (Офиц. OST)": "🟢 SwipEdit (Official OST)", "🟢 Офиц. OST": "🟢 Official OST", "Скорость, эффекты и надписи": "Speed, effects & captions", "🔄 Авто-синк ": "🔄 Auto-sync ", "🟢 Создано в SwipEdit": "🟢 Made in SwipEdit", "🎮 Превью и Звук": "🎮 Preview & Audio", "🎹 Таймлайн и Ноты": "🎹 Timeline & Notes", "⚡ Эффекты (36)": "⚡ Effects (36)", "🎵 Карта и Плейлисты (24)": "🎵 Map & Playlists (24)", "95-й перцентиль: ": "95th percentile: ", "<label>Длительность duration (сек)\n            <input type=\"number\" id=\"insp-ev-duration\" step=\"0.05\" min=\"0.05\" value=\"": "<label>Duration (sec)\n            <input type=\"number\" id=\"insp-ev-duration\" step=\"0.05\" min=\"0.05\" value=\"", "<label>Множитель скорости speed\n            <input type=\"number\" id=\"insp-ev-speed\" step=\"0.05\" min=\"0.1\" max=\"10\" value=\"": "<label>Speed multiplier speed\n            <input type=\"number\" id=\"insp-ev-speed\" step=\"0.05\" min=\"0.1\" max=\"10\" value=\"", "<label>Надпись (text)\n            <input type=\"text\" id=\"insp-ev-text\" value=\"": "<label>Text (text)\n            <input type=\"text\" id=\"insp-ev-text\" value=\"", "<label>Цвет (color)\n            <input type=\"color\" id=\"insp-ev-color\" value=\"": "<label>Color (color)\n            <input type=\"color\" id=\"insp-ev-color\" value=\"", "<option value=\"": "<option value=\"", "<option value=\"ALL\">Все 3 плейлиста (": "<option value=\"ALL\">All 3 playlists (", "BPM ": "BPM ", "BPM: ": "BPM: ", "Tap Tempo: ": "Tap Tempo: ", "Авто-BPM: определён темп ": "Auto-BPM: tempo detected ", "В meta.json: ": "In meta.json: ", "Выбрана дорожка ноты: ": "Note lane selected: ", "Выделенные ноты (": "Selected notes (", "Выделено рамкой: ": "Box-selected: ", "Выделено: ": "Selected: ", "Выделены все элементы: ": "All items selected: ", "Готово! Скачан архив ": "Done! Downloaded archive ", "Диагонали: ": "Diagonals: ", "Длина: ": "Length: ", "Добавлен эффект ": "Effect ", "Добавлена серия из ": "Added a series of ", "Загружен видео-фон ": "Video background ", "Загружен фон ": "Background ", "Загружена демо-карта «": "Demo map «", "Загружена карта \"": "Loaded map \"", "Загружена карта «": "Loaded map «", "Загружена обложка ": "Cover ", "Загружено аудио ": "Audio ", "Загружено видео ": "Video ", "Карта подписана скрытой меткой SwipEdit (": "The map is signed with a hidden SwipEdit mark (", "Нота ": "Note ", "Официальная карта «": "Official map «", "Ошибка конвертации .ctex: ": "Conversion error .ctex: ", "Ошибка конвертации .oggvorbisstr: ": "Conversion error .oggvorbisstr: ", "Ошибка сборки .swmap: ": "Error building .swmap: ", "Ошибка чтения .swmap: ": "Error reading .swmap: ", "Ошибка чтения .swmap:\\n": "Error reading .swmap:\\n", "По всему треку (": "Whole track (", "Подключено превью-видео ": "Preview video ", "Поставлен кастомный NOTE_SPEED = ": "Custom NOTE_SPEED = ", "Поставлено событие NOTE_SPEED = ": "NOTE_SPEED = ", "Проверка карты: найдено ": "Map check: ", "Распаковка ": "Unpacking ", "Режим таймлайна: ": "Timeline mode: ", "Сдвинуто: ": "Shifted: ", "Сконвертирован Godot ": "Godot ", "Скопировано вперёд (+": "Copied forward (+", "Скорость проигрывания превью: ": "Preview playback speed: ", "Сложность в meta.json установлена по расчёту плотности: ": "Difficulty in meta.json set from density calculation: ", "Событие ": "Event ", "ТАКТ (": "BAR (", "ТАКТЫ (": "BARS (", "Тактовый размер метронома и сетки: ": "Metronome and grid time signature: ", "Убрана нота ": "Note ", "Удалено выделенных элементов: ": "Selected items deleted: ", "ℹ Последний NOTE_SPEED равен ": "ℹ Last NOTE_SPEED is ", "ℹ У ноты ": "ℹ Note ", "⚠ Дубликат одинаковой ноты ": "⚠ Duplicate of the same note ", "⚠ Нота ": "⚠ Note ", "⚠ Событие NOTES_FLOW_RIGHT на ": "⚠ NOTES_FLOW_RIGHT event at ", "✅ Проблем не найдено! Нот: ": "✅ No problems found! Notes: ", "🎹 Ноты и Инспектор": "🎹 Notes & Inspector", "✨ Эффекты и События": "✨ Effects & Events", "📊 Аналитика и SDP": "📊 Analytics & SDP", "⚙ Карта и Файлы": "⚙ Map & Files", "📱 Режим вкладок": "📱 Tabbed Mode", "🖥 Режим плиток (ПК)": "🖥 Tile Mode (PC)", "🟢 SwipEdit": "🟢 SwipEdit", "🔴 Создано в Swipetava Maker (Друнов)": "🔴 Made in Swipetava Maker (Drunov)", "🔴 Сторонний редактор": "🔴 Third-party Editor", "Ничего не выбрано. Кликни по ноте или ивенту на таймлайне.": "Nothing selected. Click a note or event on the timeline.", "🆕 Новая карта": "🆕 New Map", "Создать новую пустую карту (с предупреждением о несохранённых изменениях)": "Create a new blank chart (with unsaved changes warning)", "По умолчанию (фон игры)": "Default (in-game background)", "Оставь пустым, чтобы использовать дефолтный/пользовательский фон самой игры, или укажи bg.png / bg.ogv": "Leave empty to use the game's default/custom background, or specify bg.png / bg.ogv", "🎨 Градиент": "🎨 Gradient", "Сгенерировать градиентный фон 1280×720 под цвет меню карты и вшить как bg.png": "Generate a 1280×720 gradient background matching the menu color and pack as bg.png", "Убрать фон из карты (в игре останется стандартный или кастомный фон игрока)": "Remove map background (the game will keep its default or player custom background)", "Создана новая пустая карта": "Created a new blank chart", "Открыта пустая карта. Загрузи аудио или начни ставить ноты на таймлайне.": "Opened a blank chart. Load audio or start placing notes on the timeline.", "Фон сброшен: в игре будет использоваться стандартный или кастомный фон игрока": "Background cleared: the game will use its default or player custom background", "Сгенерирован градиентный фон bg.png (1280×720) под цвет меню": "Generated gradient background bg.png (1280×720) matching menu color", "bg.png (Градиент 1280×720)": "bg.png (Gradient 1280×720)", "📐 Формула объективной сложности SDP v2.0 (SwipEdit's Difficulty Points)": "📐 Objective Difficulty Formula SDP v2.0 (SwipEdit's Difficulty Points)", "Честные звёзды": "True difficulty", "честные звёзды (Auto ★)": "true difficulty (Auto ★)", "расчёт Честных звёзд (Auto ★)": "True Difficulty calculation (Auto ★)", "5. Зависимость множителя длины от среднего NPS (L_mod) и расчёт Честных звёзд (Auto ★):": "5. Length multiplier from average NPS (L_mod) & True Difficulty (Auto ★):", "1. Временное расстояние между нотами (Δt_mean, Δt_p25) и плотность:": "1. Note time spacing (Δt_mean, Δt_p25) and density:", "2. Паттерны, углы, джеки, стаки, реверсы и наслоение (w_i):": "2. Patterns, angles, jacks, stacks, reverses and overlap (w_i):", "3. Скорость скролла, турбулентность скорости и мгновенный стрейн (M_scroll, strain_i):": "3. Scroll speed, speed turbulence and instant strain (M_scroll, strain_i):", "4. Нагруженность по эффектам (FX_load) по тяжести для восприятия:": "4. Visual effect load (FX_load) weighted by perceptual intensity:", "Учитывается не только средний NPS по карте, но и реальная дистанция": "Accounts not only for average map NPS, but also the actual time gap", "между соседними нотами и плотность быстрых сплитов/стримов (25-й перцентиль": "between adjacent notes and the density of fast splits/streams (25th percentile", "— вертикальный стак (": "— vertical stack (", "— диагональ;": "— diagonal;", "— быстрый повтор одного направления подряд (": "— fast consecutive repeat of the same direction (", "при": "at", "Δt < 0.32 с": "Δt < 0.32 s", "— резкие смены угла": "— sharp angle turns", "и серии зигзагов из 3+ нот;": "and zigzag chains of 3+ notes;", "— визуальное сближение соседних нот на дорожке (": "— visual overlap of adjacent notes on the lane (", "Высокая скорость пролёта (": "High scroll speed (", ", когда на чтение ноты остаётся": ", leaving only", "200–500 мс": "200–500 ms", ") и частые рывки": "to read a note) and frequent", ") кратно повышают нагрузку на реакцию.": "changes multiply reaction strain.", "Тяжёлые (вес 2.1–4.5):": "Heavy (weight 2.1–4.5):", "Средние (вес 1.0–1.9):": "Medium (weight 1.0–1.9):", "Лёгкие (вес 0.10–0.65):": "Light (weight 0.10–0.65):", "Чем выше средний": "The higher the average", "и скорость скролла, тем быстрее карта выходит на полный множитель длины": "and scroll speed, the faster the chart reaches full length multiplier", "(интенсивный 50-секундный уровень не занижается из-за хронометража).": "(an intense 50-second chart is not underrated due to duration).", "вычисляются напрямую из физики чарта: интервалов между нотами, скорости и дёрганий скролла, геометрии паттернов и тяжести визуальных эффектов — без потолка и без привязки к конкретным картам.": "are calculated directly from chart physics: note intervals, scroll speed and surges, pattern geometry and visual effect load — with no cap and no hardcoded map anchors.", "вычисляются напрямую из физики чарта: интервалов между нотами, скорости и дёрганий скролла, геометрии паттернов и тяжести визуальных эффектов — без потолка и без привязки к конкретным картам. Это позволяет объективнее оценивать сложность у множества различных карт.": "are calculated directly from chart physics: note intervals, scroll speed and surges, pattern geometry and visual effect load — with no cap and no hardcoded map anchors. This provides an accurate difficulty rating across all kinds of charts.", "Объективная сложность SDP v2.0 и Честные звёзды": "Objective SDP v2.0 & True Difficulty", "Создать новую пустую карту": "Create a new blank chart", "Загрузить демо-карту (Tutorial — Arvicheskyy)": "Load the demo chart (Tutorial — Arvicheskyy)", "Загрузить фоновую картинку (.png/.jpg/.webp) или готовый видео-фон .ogv напрямую в архив .swmap": "Load a background image (.png/.jpg/.webp) or a ready .ogv video background directly into the .swmap archive", "Авто-синхронизация REVERSE → NOTES_FLOW_RIGHT и REVERSE_BACK → NOTES_FLOW_LEFT (с защитой 1-й секунды)": "Auto-sync REVERSE → NOTES_FLOW_RIGHT and REVERSE_BACK → NOTES_FLOW_LEFT (with 1st-second protection)", "🔄 Авто-синк": "🔄 Auto-sync", "Официальная демо-карта Tutorial (v1.1) из саундтрека Swipetava.": "Official Tutorial demo chart (v1.1) from the Swipetava soundtrack.", "📱 Горизонтальный GUI": "📱 Landscape GUI", "Включить горизонтальный мобильный интерфейс (Landscape DAW с боковым рейлом и плавающим превью)": "Switch to Landscape mobile GUI (Landscape DAW with side rail and floating preview)", "🎬 Превью карты": "🎬 Map Preview", "⤢ Развернуть": "⤢ Expand", "⤡ Свернуть": "⤡ Compact", "Развернуть / свернуть микшер, транспорт и инспектор внутри окна превью": "Expand / collapse mixer, transport and inspector inside the preview window", "Скрыть окно превью (открывается кнопкой 🎬 Превью)": "Hide preview window (reopen via 🎬 Preview button)", "Открыть / скрыть окно живого превью карты": "Open / hide live map preview window", "Пуск / Пауза (Space)": "Play / Pause (Space)", "В начало": "Stop / To start", "🆕 Новая": "🆕 New", "📂 Открыть": "📂 Open", "⛶ Полный экран": "⛶ Fullscreen", "🖥 Классич. вид": "🖥 Classic View", "Полный экран + Горизонтальный разворот (Fullscreen API / 90°)": "Fullscreen + Landscape rotation (Fullscreen API / 90°)", "Вернуться в классический вид редактора": "Return to classic editor view", "Карандаш / Правка нот": "Pencil / Edit notes", "Выделение рамкой и перетаскивание группы": "Box selection & group drag", "Прокрутка и зум таймлайна": "Scroll & zoom timeline", "Ластик": "Eraser", "Правка": "Edit", "Рамка": "Select", "Скролл": "Scroll", "Превью": "Preview", "Ивенты": "Events", "Карта": "Map", "Открыть панель Событий, Шейдеров и NOTE_SPEED": "Open Events, Shaders & NOTE_SPEED drawer", "Открыть параметры карты, Аудио, Фон и Плейлисты": "Open Map settings, Audio, Background & Playlists drawer", "Открыть статистику NPS и SDP v2.0": "Open NPS & SDP v2.0 analytics drawer", "🌙 Тема": "🌙 Theme", "☀️ Тема": "☀️ Theme", "🌙 Тёмная": "🌙 Dark", "☀️ Светлая": "☀️ Light", "Переключить тему (Тёмная / Светлая, авто по системе)": "Toggle theme (Dark / Light, auto from device)", "Переключить тему (Тёмная / Светлая)": "Toggle theme (Dark / Light)"};
 
   const I18N_REGEX_EN = [
     [/^Выделено:\s*(\d+)\s*нот,\s*(\d+)\s*событий$/i, 'Selected: $1 notes, $2 events'],

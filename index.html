@@ -1088,6 +1088,9 @@
       width: auto;
       display: block;
     }
+    html[data-theme="light"] .wtfpl-badge-img {
+      filter: brightness(0);
+    }
 
   
     /* --- Вкладочный интерфейс (мобильный по умолчанию + переключатель на ПК) --- */
@@ -1635,7 +1638,7 @@
       position: absolute !important;
       right: 12px;
       bottom: 28px;
-      width: 250px !important;
+      width: 292px !important;
       max-height: calc(100% - 36px) !important;
       pointer-events: auto !important;
       background: var(--bg-1) !important;
@@ -1704,16 +1707,92 @@
       display: none !important;
     }
     body.ls-proto-active:not(.ls-pip-expanded) .panel-preview .transport-bar,
-    body.ls-proto-active:not(.ls-pip-expanded) .panel-preview .section-box {
+    body.ls-proto-active:not(.ls-pip-expanded) .panel-preview .section-box,
+    body.ls-proto-active:not(.ls-pip-expanded) .panel-preview .audio-mixer-bar > .metro-timesig-box,
+    body.ls-proto-active:not(.ls-pip-expanded) .panel-preview .audio-mixer-bar > label.chk-label {
       display: none !important;
     }
-    body.ls-proto-active .panel-preview .preview-stage {
-      padding: 8px !important;
+    /* Свёрнутый вид превью в горизонтальном режиме: слева карта, сбоку вертикальный микшер */
+    body.ls-proto-active:not(.ls-pip-expanded) .panel-preview .preview-stage {
+      display: flex !important;
+      flex-direction: row !important;
+      align-items: stretch !important;
+      justify-content: space-between !important;
+      padding: 6px !important;
       gap: 6px !important;
     }
     body.ls-proto-active:not(.ls-pip-expanded) .panel-preview .canvas-frame {
-      max-width: 175px !important;
-      margin: 0 auto !important;
+      width: 192px !important;
+      max-width: 192px !important;
+      height: 108px !important;
+      flex: 0 0 192px !important;
+      margin: 0 !important;
+      align-self: center !important;
+    }
+    body.ls-proto-active:not(.ls-pip-expanded) .panel-preview .audio-mixer-bar {
+      flex: 1 1 auto !important;
+      width: auto !important;
+      height: 108px !important;
+      margin: 0 !important;
+      padding: 4px 3px !important;
+      display: flex !important;
+      flex-direction: row !important;
+      align-items: stretch !important;
+      justify-content: space-around !important;
+      flex-wrap: nowrap !important;
+      gap: 2px !important;
+    }
+    body.ls-proto-active:not(.ls-pip-expanded) .panel-preview .audio-mixer-bar > .mixer-channel {
+      display: flex !important;
+      flex-direction: column-reverse !important;
+      align-items: center !important;
+      justify-content: space-between !important;
+      flex: 1 1 0 !important;
+      min-width: 22px !important;
+      height: 100% !important;
+      gap: 2px !important;
+      padding: 0 !important;
+    }
+    body.ls-proto-active:not(.ls-pip-expanded) .panel-preview .audio-mixer-bar .mixer-lbl-text {
+      display: none !important;
+    }
+    body.ls-proto-active:not(.ls-pip-expanded) .panel-preview .audio-mixer-bar .mixer-ch-head {
+      display: inline-flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      gap: 1px !important;
+      font-size: 10.5px !important;
+      line-height: 1 !important;
+      margin: 0 !important;
+    }
+    body.ls-proto-active:not(.ls-pip-expanded) .panel-preview .audio-mixer-bar .mixer-ch-head input[type="checkbox"] {
+      width: 10px !important;
+      height: 10px !important;
+      margin: 0 !important;
+    }
+    body.ls-proto-active:not(.ls-pip-expanded) .panel-preview .audio-mixer-bar .mixer-channel input[type="range"] {
+      writing-mode: vertical-lr !important;
+      direction: rtl !important;
+      width: 16px !important;
+      height: 58px !important;
+      min-width: 0 !important;
+      flex: 0 0 58px !important;
+      margin: 0 !important;
+      padding: 0 !important;
+    }
+    body.ls-proto-active:not(.ls-pip-expanded) .panel-preview .audio-mixer-bar .mixer-val {
+      font-size: 8.5px !important;
+      min-width: 0 !important;
+      line-height: 1 !important;
+      text-align: center !important;
+    }
+    /* Развёрнутый вид превью в горизонтальном режиме: один в один как в предыдущем билде */
+    body.ls-proto-active.ls-pip-expanded .panel-preview .preview-stage {
+      display: flex !important;
+      flex-direction: column !important;
+      align-items: center !important;
+      padding: 8px !important;
+      gap: 6px !important;
     }
     body.ls-proto-active.ls-pip-expanded .panel-preview .canvas-frame {
       max-width: 260px !important;
@@ -1812,7 +1891,6 @@
     <button type="button" class="ls-rail-btn" id="ls-rail-undo" title="Отменить (Ctrl+Z)">↶<span>Undo</span></button>
     <button type="button" class="ls-rail-btn" id="ls-rail-redo" title="Повторить (Ctrl+Y)">↷<span>Redo</span></button>
     <div class="ls-rail-sep"></div>
-    <button type="button" class="ls-rail-btn active" id="ls-rail-pip" title="Открыть / скрыть окно живого превью карты">🎬<span>Превью</span></button>
     <button type="button" class="ls-rail-btn" data-ls-drawer-btn="events" title="Открыть панель Событий, Шейдеров и NOTE_SPEED">⚡<span>Ивенты</span></button>
     <button type="button" class="ls-rail-btn" data-ls-drawer-btn="meta" title="Открыть параметры карты, Аудио, Фон и Плейлисты">⚙<span>Карта</span></button>
     <button type="button" class="ls-rail-btn" data-ls-drawer-btn="stats" title="Открыть статистику NPS и SDP v2.0">📊<span>SDP</span></button>
@@ -1945,7 +2023,7 @@
             <span>Тайминг и базовая скорость скролла</span>
             <div style="display:flex;gap:4px;">
               <button type="button" class="btn btn-sm" id="btn-auto-bpm" title="Автоматически определить BPM и сдвиг сетки (gridOffset) по загруженному аудио">⚡ Авто BPM</button>
-              <button type="button" class="btn btn-sm" id="btn-tap-tempo" title="Нажимай в ритм для определения BPM">🥁 Tap BPM</button>
+              <button type="button" class="btn btn-sm" id="btn-tap-tempo" title="Нажимай в ритм мышью или клавишей T для определения BPM">🥁 Tap BPM (T)</button>
             </div>
           </div>
           <div class="field-grid-2">
@@ -1954,8 +2032,11 @@
               <input type="number" id="chart-bpm" min="20" max="400" step="0.5" value="165" />
             </div>
             <div>
-              <label style="font-size:11px;color:var(--text-secondary);">Сдвиг сетки (gridOffset, с)</label>
-              <input type="number" id="chart-grid-offset" step="0.005" value="0.09" />
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:4px;">
+                <label style="font-size:11px;color:var(--text-secondary);">Сдвиг сетки (gridOffset, с)</label>
+                <button type="button" class="btn btn-xs" id="btn-offset-to-cursor" title="Поставить сдвиг сетки (первую точку темпа) ровно на текущую позицию курсора">🎯 В курсор</button>
+              </div>
+              <input type="number" id="chart-grid-offset" step="0.001" value="0.09" />
             </div>
           </div>
           <div class="field-row" style="margin-top:4px;">
@@ -2073,17 +2154,17 @@
         <!-- Микшер громкости: BGM, Хитсаунды, Метроном -->
         <div class="audio-mixer-bar" aria-label="Регулировка громкости превью">
           <div class="mixer-channel" title="Громкость музыки (BGM)">
-            <span>🎵 Музыка:</span>
+            <span class="mixer-ch-head"><span>🎵</span><span class="mixer-lbl-text"> Музыка:</span></span>
             <input type="range" id="vol-bgm" min="0" max="100" step="1" value="70" />
             <span class="mixer-val" id="vol-bgm-val">70%</span>
           </div>
           <div class="mixer-channel" title="Включить и настроить громкость хитсаундов нот (до 200% усиления)">
-            <label class="chk-label"><input type="checkbox" id="check-hitsound" checked /><span class="chk-text">🥁 Хитсаунд:</span></label>
+            <label class="chk-label mixer-ch-head"><input type="checkbox" id="check-hitsound" checked /><span class="chk-text"><span>🥁</span><span class="mixer-lbl-text"> Хитсаунд:</span></span></label>
             <input type="range" id="vol-hitsound" min="0" max="200" step="5" value="110" />
             <span class="mixer-val" id="vol-hitsound-val">110%</span>
           </div>
           <div class="mixer-channel" title="Включить и настроить громкость метронома по сетке BPM (до 200% усиления)">
-            <label class="chk-label"><input type="checkbox" id="check-metronome" /><span class="chk-text">⏱ Метроном:</span></label>
+            <label class="chk-label mixer-ch-head"><input type="checkbox" id="check-metronome" /><span class="chk-text"><span>⏱</span><span class="mixer-lbl-text"> Метроном:</span></span></label>
             <input type="range" id="vol-metronome" min="0" max="200" step="5" value="110" />
             <span class="mixer-val" id="vol-metronome-val">110%</span>
           </div>
@@ -2426,10 +2507,6 @@
         </span>
       </div>
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-        <div class="touch-mode-group" title="Вид дорожки нот: 10-рядный Пиано-ролл (удобно для телефонов и стаков) или Компактно (1 ряд)">
-          <button type="button" class="touch-mode-btn active" data-tl-view="pianoroll" id="btn-tl-view-piano">🎹 Пиано-ролл (10 рядов)</button>
-          <button type="button" class="touch-mode-btn" data-tl-view="compact" id="btn-tl-view-compact">📏 Компактно (1 ряд)</button>
-        </div>
         <div class="touch-mode-group" title="Режим касания пальцем / мышью по таймлайну">
           <button type="button" class="touch-mode-btn active" data-touch-mode="draw">✎ Правка</button>
           <button type="button" class="touch-mode-btn" data-touch-mode="select">⬚ Выделение (Рамка/Группа)</button>
